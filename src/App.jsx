@@ -178,6 +178,15 @@ const STORAGE_KEY = 'ahp_v3';
 const nowTime = () => new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
 const genRef = () => `AHP-${new Date().getFullYear()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 
+const EMPTY_PROP = {
+  name: '', city: '', country: '', chain: false, chainName: '',
+  category: '4★', roomCount: '', roomTypes: [],
+  hasPool: false, poolCapacity: '', poolCount: '1',
+  hasSpa: false,
+  hasRestaurant: false, fbCapacity: '', menuVariety: '', menuComplexity: '', authenticCuisine: false, hasWineList: false,
+  shiftCount: '3', rotationPattern: '2-2-3', shiftTimes: {},
+};
+
 // prop (camelCase, UI state) -> properties table row (snake_case)
 const propToRow = (p, userId) => ({
   name: p.name, city: p.city, country: p.country,
@@ -192,6 +201,21 @@ const propToRow = (p, userId) => ({
   created_by: userId,
 });
 
+// properties table row (snake_case) -> prop (camelCase, UI state) — reverse of the above,
+// used when re-opening a past audit from history
+const rowToProp = (row) => ({
+  name: row.name || '', city: row.city || '', country: row.country || '',
+  chain: !!row.chain, chainName: row.chain_name || '',
+  category: row.category || '4★', roomCount: row.room_count != null ? String(row.room_count) : '',
+  roomTypes: row.room_types || [],
+  hasPool: !!row.has_pool, poolCapacity: row.pool_capacity != null ? String(row.pool_capacity) : '', poolCount: row.pool_count != null ? String(row.pool_count) : '1',
+  hasSpa: !!row.has_spa,
+  hasRestaurant: !!row.has_restaurant, fbCapacity: row.fb_capacity != null ? String(row.fb_capacity) : '',
+  menuVariety: row.menu_variety || '', menuComplexity: row.menu_complexity || '',
+  authenticCuisine: !!row.authentic_cuisine, hasWineList: !!row.has_wine_list,
+  shiftCount: row.shift_count || '3', rotationPattern: row.rotation_pattern || '', shiftTimes: row.shift_times || {},
+});
+
 export default function AHPAudit() {
   const [screen, setScreen]               = useState('loading');
   const [session, setSession]             = useState(undefined); // undefined = not checked yet, null = signed out
@@ -201,20 +225,20 @@ export default function AHPAudit() {
   const [authBusy, setAuthBusy]           = useState(false);
   const [syncState, setSyncState]         = useState('offline'); // offline | synced | error
   const [ids, setIds]                     = useState({ propertyId: null, auditId: null, auditRef: null });
-  const [prop, setProp]                   = useState({
-    name: '', city: '', country: '', chain: false, chainName: '',
-    category: '4★', roomCount: '', roomTypes: [],
-    hasPool: false, poolCapacity: '', poolCount: '1',
-    hasSpa: false,
-    hasRestaurant: false, fbCapacity: '', menuVariety: '', menuComplexity: '', authenticCuisine: false, hasWineList: false,
-    shiftCount: '3', rotationPattern: '2-2-3', shiftTimes: {},
-  });
+  const [auditStatus, setAuditStatus]     = useState('draft'); // draft | published — of the currently loaded audit
+  const [prop, setProp]                   = useState({ ...EMPTY_PROP });
   const [activeShiftId, setActiveShiftId] = useState('morning');
   const [activeSection, setActiveSection] = useState(null);
   const [audit, setAudit]                 = useState({});
   const [openNotes, setOpenNotes]         = useState({});
   const [summaryDraft, setSummaryDraft]   = useState('');
   const [publishState, setPublishState]   = useState('idle'); // idle | saving | done | error
+
+  // ---------- audit history ----------
+  const [auditsList, setAuditsList]       = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyFilter, setHistoryFilter] = useState('all'); // all | draft | published
+  const [historySearch, setHistorySearch] = useState('');
 
   const shifts = (SHIFT_SYSTEMS[prop.shiftCount] || SHIFT_SYSTEMS['3']).shifts.map(s => ({ ...s, time: (prop.shiftTimes && prop.shiftTimes[s.id]) || s.time }));
 
@@ -253,6 +277,7 @@ export default function AHPAudit() {
           if (data.prop) setProp(data.prop);
           if (data.audit) setAudit(data.audit);
           if (data.ids) setIds(data.ids);
+          if (data.auditStatus) setAuditStatus(data.auditStatus);
           const sys = SHIFT_SYSTEMS[data.prop && data.prop.shiftCount] || SHIFT_SYSTEMS['3'];
           setActiveShiftId(sys.shifts[0].id);
           setScreen(data.prop && data.prop.name ? 'home' : 'setup');
@@ -277,7 +302,7 @@ export default function AHPAudit() {
           const remoteAudit = {};
           items.forEach(row => {
             remoteAudit[row.item_id] = remoteAudit[row.item_id] || {};
-            remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time };
+            remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time, critical: row.critical };
           });
           setAudit(remoteAudit);
         }
@@ -287,8 +312,21 @@ export default function AHPAudit() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session, ids.auditId]);
 
-  const persist = useCallback(async (p, a, i) => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ prop: p, audit: a, ids: i })); } catch(e) {}
+  // fetch the audit list whenever the history screen is opened
+  useEffect(() => {
+    if (screen !== 'history' || !session) return;
+    setHistoryLoading(true);
+    supabase.from('audits')
+      .select('id, ref, date, status, tier, property_id, properties(name, city, country)')
+      .order('date', { ascending: false })
+      .then(({ data, error }) => {
+        setHistoryLoading(false);
+        if (!error) setAuditsList(data || []);
+      });
+  }, [screen, session]);
+
+  const persist = useCallback(async (p, a, i, st) => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ prop: p, audit: a, ids: i, auditStatus: st })); } catch(e) {}
   }, []);
 
   // creates (or reuses) the property + audit rows in Supabase once the auditor hits BEGIN AUDIT
@@ -352,7 +390,7 @@ export default function AHPAudit() {
     const shiftPrev = prev[activeShiftId] || {};
     const time = shiftPrev.time || nowTime();
     const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, status, time } } };
-    setAudit(updated); persist(prop, updated, ids);
+    setAudit(updated); persist(prop, updated, ids, auditStatus);
     if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status, time, note: shiftPrev.note || null, critical: !!shiftPrev.critical });
   };
 
@@ -360,7 +398,7 @@ export default function AHPAudit() {
     const prev = audit[itemId] || {};
     const shiftPrev = prev[activeShiftId] || {};
     const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, note } } };
-    setAudit(updated); persist(prop, updated, ids);
+    setAudit(updated); persist(prop, updated, ids, auditStatus);
     if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note, time: shiftPrev.time || null, critical: !!shiftPrev.critical });
   };
 
@@ -369,7 +407,7 @@ export default function AHPAudit() {
     const shiftPrev = prev[activeShiftId] || {};
     const critical = !shiftPrev.critical;
     const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, critical } } };
-    setAudit(updated); persist(prop, updated, ids);
+    setAudit(updated); persist(prop, updated, ids, auditStatus);
     if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note: shiftPrev.note || null, time: shiftPrev.time || null, critical });
   };
 
@@ -398,11 +436,51 @@ export default function AHPAudit() {
       }).eq('id', ids.auditId);
       if (error) throw error;
       setSyncState('synced');
+      setAuditStatus('published');
+      persist(prop, audit, ids, 'published');
       return { ok: true };
     } catch (e) {
       setSyncState('error');
       return { ok: false, reason: 'error' };
     }
+  };
+
+  // ---------- history: open a past audit, or start a brand new one ----------
+  const openAudit = async (auditRow) => {
+    setScreen('loading');
+    try {
+      const { data: propRow, error: pErr } = await supabase.from('properties').select('*').eq('id', auditRow.property_id).single();
+      if (pErr) throw pErr;
+      const { data: items, error: iErr } = await supabase.from('audit_items').select('*').eq('audit_id', auditRow.id);
+      if (iErr) throw iErr;
+
+      const nextProp = rowToProp(propRow);
+      const nextAudit = {};
+      (items || []).forEach(row => {
+        nextAudit[row.item_id] = nextAudit[row.item_id] || {};
+        nextAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time, critical: row.critical };
+      });
+      const nextIds = { propertyId: auditRow.property_id, auditId: auditRow.id, auditRef: auditRow.ref };
+      const sys = SHIFT_SYSTEMS[nextProp.shiftCount] || SHIFT_SYSTEMS['3'];
+
+      setProp(nextProp); setAudit(nextAudit); setIds(nextIds); setAuditStatus(auditRow.status);
+      setActiveShiftId(sys.shifts[0].id);
+      setSummaryDraft(''); setPublishState('idle');
+      persist(nextProp, nextAudit, nextIds, auditRow.status);
+      setSyncState('synced');
+      setScreen('home');
+    } catch (e) {
+      setSyncState('error');
+      setScreen('history');
+    }
+  };
+
+  const startNewAudit = () => {
+    const freshIds = { propertyId: null, auditId: null, auditRef: null };
+    setProp({ ...EMPTY_PROP }); setAudit({}); setIds(freshIds); setAuditStatus('draft');
+    setSummaryDraft(''); setPublishState('idle');
+    persist({ ...EMPTY_PROP }, {}, freshIds, 'draft');
+    setScreen('setup');
   };
 
   const rank = STAR_RANK[prop.category] || 4;
@@ -494,6 +572,68 @@ export default function AHPAudit() {
               Accounts are created by the team admin — contact them if you don't have one yet.
             </div>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === 'history') {
+    const filtered = auditsList.filter(a => {
+      if (historyFilter !== 'all' && a.status !== historyFilter) return false;
+      if (historySearch) {
+        const q = historySearch.toLowerCase();
+        const name = (a.properties && a.properties.name || '').toLowerCase();
+        const city = (a.properties && a.properties.city || '').toLowerCase();
+        if (!name.includes(q) && !city.includes(q)) return false;
+      }
+      return true;
+    });
+    return (
+      <div style={appStyle}>
+        <div style={headerStyle}>
+          <span style={logoStyle}>A · H · P</span>
+          <button onClick={() => setScreen(prop.name ? 'home' : 'setup')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Close</button>
+        </div>
+        <div style={bodyStyle}>
+          <div style={{ marginBottom: '20px' }}>
+            <h1 style={{ fontSize: '20px', fontWeight: '700', margin: '0 0 4px' }}>Past Audits</h1>
+            <p style={{ color: C.dim, fontSize: '13px', margin: 0 }}>Every audit across the team, synced from Supabase</p>
+          </div>
+
+          <button onClick={startNewAudit} style={{ width: '100%', marginBottom: '16px', padding: '13px', borderRadius: '10px', border: 'none', background: C.gold, color: '#0C0C0F', fontSize: '13px', fontWeight: '700', letterSpacing: '0.05em', cursor: 'pointer' }}>
+            + NEW AUDIT
+          </button>
+
+          <div style={{ marginBottom: '10px' }}>
+            <input style={inp} placeholder="Search property or city..." value={historySearch} onChange={e => setHistorySearch(e.target.value)} />
+          </div>
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '18px' }}>
+            {['all', 'draft', 'published'].map(f => {
+              const active = historyFilter === f;
+              return <button key={f} onClick={() => setHistoryFilter(f)} style={{ flex: 1, padding: '9px 6px', borderRadius: '8px', cursor: 'pointer', border: `1px solid ${active ? C.gold : C.border}`, background: active ? C.goldBg : 'transparent', color: active ? C.gold : C.dim, fontSize: '12px', fontWeight: '600', textTransform: 'capitalize' }}>{f}</button>;
+            })}
+          </div>
+
+          {historyLoading && <div style={{ color: C.dim, fontSize: '13px', padding: '20px 0', textAlign: 'center' }}>Loading…</div>}
+          {!historyLoading && filtered.length === 0 && (
+            <div style={{ color: C.dim, fontSize: '13px', padding: '30px 0', textAlign: 'center' }}>No audits found.</div>
+          )}
+          {!historyLoading && filtered.map(a => {
+            const pname = (a.properties && a.properties.name) || 'Untitled property';
+            const pcity = a.properties && a.properties.city;
+            const pcountry = a.properties && a.properties.country;
+            return (
+              <div key={a.id} onClick={() => openAudit(a)} style={card({ cursor: 'pointer' })}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '4px', gap: '10px' }}>
+                  <span style={{ fontSize: '14px', fontWeight: '600' }}>{pname}</span>
+                  <span style={{ fontSize: '10px', fontWeight: '700', letterSpacing: '0.05em', color: a.status === 'published' ? '#4DC87A' : C.dim, flexShrink: 0 }}>{a.status.toUpperCase()}</span>
+                </div>
+                <div style={{ fontSize: '12px', color: C.dim }}>
+                  {[pcity, pcountry].filter(Boolean).join(', ')}{(pcity || pcountry) ? ' · ' : ''}{a.ref} · {a.date}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
     );
@@ -673,7 +813,7 @@ export default function AHPAudit() {
             const sys = SHIFT_SYSTEMS[prop.shiftCount] || SHIFT_SYSTEMS['3'];
             setActiveShiftId(sys.shifts[0].id);
             const nextIds = await ensureRemoteAudit();
-            persist(prop, audit, nextIds);
+            persist(prop, audit, nextIds, auditStatus);
             setScreen('home');
           }} style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: canStart ? C.gold : C.surface2, color: canStart ? '#0C0C0F' : C.muted, fontSize: '14px', fontWeight: '700', letterSpacing: '0.06em', cursor: canStart ? 'pointer' : 'default' }}>
             BEGIN AUDIT
@@ -681,6 +821,11 @@ export default function AHPAudit() {
           {!session && (
             <div style={{ textAlign: 'center', marginTop: '10px' }}>
               <button onClick={() => setScreen('login')} style={{ background: 'none', border: 'none', color: C.muted, fontSize: '12px', cursor: 'pointer' }}>Sign in to sync this audit across devices</button>
+            </div>
+          )}
+          {session && (
+            <div style={{ textAlign: 'center', marginTop: '10px' }}>
+              <button onClick={() => setScreen('history')} style={{ background: 'none', border: 'none', color: C.muted, fontSize: '12px', cursor: 'pointer' }}>View past audits</button>
             </div>
           )}
         </div>
@@ -705,6 +850,9 @@ export default function AHPAudit() {
             <span style={{ fontSize: '10px', fontWeight: '600', letterSpacing: '0.06em', color: !session ? C.muted : syncState === 'synced' ? '#4DC87A' : syncState === 'error' ? C.warn : C.muted }}>
               {!session ? 'OFFLINE' : syncState === 'synced' ? 'SYNCED' : syncState === 'error' ? 'SYNC ERROR' : 'LOCAL'}
             </span>
+            {session && (
+              <button onClick={() => setScreen('history')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>History</button>
+            )}
             <button onClick={() => setScreen('setup')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Edit</button>
             {session && (
               <button onClick={signOut} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: '12px', padding: 0 }}>Sign out</button>
@@ -714,7 +862,12 @@ export default function AHPAudit() {
         <ShiftBar />
         <div style={bodyStyle}>
           <div style={{ marginBottom: '20px' }}>
-            <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>{prop.category} · {prop.city}{prop.country ? ', ' + prop.country : ''}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '5px' }}>
+              <span style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600' }}>{prop.category} · {prop.city}{prop.country ? ', ' + prop.country : ''}</span>
+              <span style={{ fontSize: '9px', fontWeight: '700', letterSpacing: '0.06em', color: auditStatus === 'published' ? '#4DC87A' : C.muted, border: `1px solid ${auditStatus === 'published' ? 'rgba(77,200,122,0.35)' : C.border}`, padding: '1px 6px', borderRadius: '4px' }}>
+                {auditStatus.toUpperCase()}
+              </span>
+            </div>
             <h1 style={{ fontSize: '19px', fontWeight: '700', margin: '0 0 3px' }}>{prop.name}</h1>
             <div style={{ fontSize: '12px', color: C.dim }}>
               {prop.chain ? (prop.chainName || 'Chain') : 'Independent'} · {prop.roomCount} rooms{prop.roomTypes.length ? ' (' + prop.roomTypes.join(', ') + ')' : ''} · {(SHIFT_SYSTEMS[prop.shiftCount] || SHIFT_SYSTEMS['3']).label}{prop.rotationPattern ? ' · ' + prop.rotationPattern : ''}
@@ -828,6 +981,9 @@ export default function AHPAudit() {
                   speculaone.com/report.html?ref={ids.auditRef}
                 </div>
               )}
+              <button onClick={startNewAudit} style={{ width: '100%', marginTop: '14px', padding: '13px', borderRadius: '10px', border: `1px solid ${C.goldBorder}`, background: 'transparent', color: C.gold, fontSize: '13px', fontWeight: '700', letterSpacing: '0.05em', cursor: 'pointer' }}>
+                + START NEXT AUDIT
+              </button>
             </div>
           )}
         </div>
