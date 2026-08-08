@@ -28,6 +28,12 @@ const SECTIONS = [
     { id: 'PRE-05', label: 'Confirmation email professional and on-brand', minStars: 4 },
     { id: 'PRE-06', label: 'Pre-arrival preference questionnaire sent', minStars: 5 },
     { id: 'PRE-07', label: 'Dedicated concierge contact provided pre-stay', minStars: 6 },
+    { id: 'PRE-08', label: 'Overall marketing presence strong and consistent', minStars: 4 },
+    { id: 'PRE-09', label: 'Website quality — design, content, ease of use', minStars: 4 },
+    { id: 'PRE-10', label: 'Phone call to reception — responsiveness and helpfulness', minStars: 4 },
+    { id: 'PRE-11', label: 'Email response — timeliness and quality', minStars: 4 },
+    { id: 'PRE-12', label: 'Social media presence active and on-brand', minStars: 4 },
+    { id: 'PRE-13', label: 'List of bookable extras/services sent pre-arrival', minStars: 5 },
   ]},
   { id: 'arrival', label: 'Arrival & Entrance', icon: '→', facility: null, items: [
     { id: 'ARR-01', label: 'Exterior clean and well-maintained', minStars: 4 },
@@ -37,6 +43,11 @@ const SECTIONS = [
     { id: 'ARR-05', label: 'Doorman or valet present', minStars: 5 },
     { id: 'ARR-06', label: 'Welcome drink or cold towel offered', minStars: 5 },
     { id: 'ARR-07', label: 'Bespoke welcome ritual or experience', minStars: 6 },
+    { id: 'ARR-08', label: 'Disabled access available and functional', minStars: 4 },
+    { id: 'ARR-09', label: 'Lighting appropriate throughout', minStars: 4 },
+    { id: 'ARR-10', label: 'Furniture in good condition', minStars: 4 },
+    { id: 'ARR-11', label: 'Cushions fluffed, no visible dust', minStars: 4 },
+    { id: 'ARR-12', label: 'Music/mood present and at appropriate volume', minStars: 4 },
   ]},
   { id: 'reception', label: 'Reception & Check-in', icon: '⊡', facility: null, items: [
     { id: 'REC-01', label: 'Wait time under 3 minutes', minStars: 4 },
@@ -46,6 +57,9 @@ const SECTIONS = [
     { id: 'REC-05', label: 'Room preference acknowledged or upgraded', minStars: 5 },
     { id: 'REC-06', label: 'Private or in-room check-in offered', minStars: 6 },
     { id: 'REC-07', label: 'Personal butler or liaison introduced', minStars: 6 },
+    { id: 'REC-08', label: 'Front desk free of clutter', minStars: 4 },
+    { id: 'REC-09', label: 'Total check-in time reasonable', minStars: 4 },
+    { id: 'REC-10', label: 'Tour offered or facilities map explained', minStars: 4 },
   ]},
   { id: 'room', label: 'Room Quality', icon: '□', facility: null, items: [
     { id: 'RM-01', label: 'Surfaces dust-free, mirrors spotless', minStars: 4 },
@@ -56,6 +70,16 @@ const SECTIONS = [
     { id: 'RM-06', label: 'Premium minibar and luxury amenities', minStars: 5 },
     { id: 'RM-07', label: 'Welcome gift or personal note present', minStars: 5 },
     { id: 'RM-08', label: 'Guest preferences pre-applied (pillow, temp)', minStars: 6 },
+    { id: 'RM-09', label: 'Nothing in the room visibly outdated', minStars: 4 },
+    { id: 'RM-10', label: 'Minibar cleared/reset since last guest', minStars: 4 },
+  ]},
+  { id: 'facilities', label: 'Facilities', icon: '⚙', facility: null, items: [
+    { id: 'FAC-01', label: 'Overall exterior condition well maintained', minStars: 4 },
+    { id: 'FAC-02', label: 'Overall interior condition well maintained', minStars: 4 },
+    { id: 'FAC-03', label: 'General maintenance standards high', minStars: 4 },
+    { id: 'FAC-04', label: 'Gym equipment modern and well maintained', minStars: 4 },
+    { id: 'FAC-05', label: 'Gym access cost clearly disclosed (free or paid)', minStars: 4 },
+    { id: 'FAC-06', label: 'Gym has a view or pleasant environment', minStars: 5 },
   ]},
   { id: 'bathroom', label: 'Bathroom', icon: '◎', facility: null, items: [
     { id: 'BTH-01', label: 'No mold, mildew, or drain odor', minStars: 4 },
@@ -79,6 +103,8 @@ const SECTIONS = [
     { id: 'BRK-10', label: 'A la carte or cooked-to-order station', minStars: 5 },
     { id: 'BRK-11', label: 'In-room breakfast well-executed', minStars: 5 },
     { id: 'BRK-12', label: 'Personalized dietary preferences remembered', minStars: 6 },
+    { id: 'BRK-13', label: 'Overall food quality high', minStars: 4 },
+    { id: 'BRK-14', label: 'Buffet and/or à la carte clearly presented', minStars: 4 },
   ]},
   { id: 'lunch', label: 'Lunch & All-Day Dining', icon: '◑', facility: 'hasRestaurant', items: [
     { id: 'LUN-01', label: 'Menu available and easy to navigate', minStars: 4 },
@@ -90,6 +116,7 @@ const SECTIONS = [
     { id: 'LUN-07', label: 'Portion sizes appropriate for price point', minStars: 4 },
     { id: 'LUN-08', label: 'Seasonal or market-driven menu', minStars: 5 },
     { id: 'LUN-09', label: 'Chef visible or kitchen open concept', minStars: 5 },
+    { id: 'LUN-10', label: 'Menu physically clean and in good condition', minStars: 4 },
   ]},
   { id: 'restaurant', label: 'Restaurant & Dinner', icon: '◇', facility: 'hasRestaurant', items: [
     { id: 'RST-01', label: 'Food fresh and at correct temperature', minStars: 4 },
@@ -103,6 +130,7 @@ const SECTIONS = [
     { id: 'RST-09', label: 'Wine list curated and appropriate for category', minStars: 5 },
     { id: 'RST-10', label: 'Tasting menu or chefs table available', minStars: 6 },
     { id: 'RST-11', label: 'Michelin star or recognized culinary identity', minStars: 6 },
+    { id: 'RST-12', label: 'Food cooked to correct doneness — not under or overcooked', minStars: 4 },
   ]},
   { id: 'fbservice', label: 'F&B Service', icon: '◈', facility: 'hasRestaurant', items: [
     { id: 'FBS-01', label: 'Greeted and seated promptly', minStars: 4 },
@@ -125,6 +153,10 @@ const SECTIONS = [
     { id: 'PL-06', label: 'Pool attendant present and attentive', minStars: 5 },
     { id: 'PL-07', label: 'Poolside beverage service available', minStars: 5 },
     { id: 'PL-08', label: 'Architectural or infinity pool design', minStars: 6 },
+    { id: 'PL-09', label: 'Pool overall clean and well maintained', minStars: 4 },
+    { id: 'PL-10', label: 'Water clarity good', minStars: 4 },
+    { id: 'PL-11', label: 'Family-friendly features present (kids pool/splash area)', minStars: 4 },
+    { id: 'PL-12', label: 'Waterslides present and functioning (if applicable)', minStars: 5 },
   ]},
   { id: 'spa', label: 'Spa & Wellness', icon: '✦', facility: 'hasSpa', items: [
     { id: 'SP-01', label: 'Relaxing atmosphere from entrance', minStars: 4 },
@@ -135,6 +167,10 @@ const SECTIONS = [
     { id: 'SP-06', label: 'Premium product brands used in treatments', minStars: 5 },
     { id: 'SP-07', label: 'Thermal journey or circuit available', minStars: 6 },
     { id: 'SP-08', label: 'Bespoke treatment programming', minStars: 6 },
+    { id: 'SP-09', label: 'Sauna, steam room, infrared or similar present', minStars: 4 },
+    { id: 'SP-10', label: 'Interior lighting appropriate', minStars: 4 },
+    { id: 'SP-11', label: 'Massage/treatments offered', minStars: 4 },
+    { id: 'SP-12', label: 'Treatment quality (if a treatment was received — describe in notes)', minStars: 4 },
   ]},
   { id: 'housekeeping', label: 'Housekeeping', icon: '⌂', facility: null, items: [
     { id: 'HK-01', label: 'Room cleaned on time', minStars: 4 },
