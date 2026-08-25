@@ -436,7 +436,10 @@ export default function AHPAudit() {
           const remoteAudit = {};
           items.forEach(row => {
             remoteAudit[row.item_id] = remoteAudit[row.item_id] || {};
-            remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time };
+            // critical must be carried across too: it is written by pushItem, it
+            // drives getCriticalFailures(), and that decides both the published
+            // critical_failures payload and whether the audit meets the standard.
+            remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time, critical: !!row.critical };
           });
           setAudit(remoteAudit);
         }
