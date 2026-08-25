@@ -228,6 +228,29 @@ const propToRow = (p, userId) => ({
   created_by: userId,
 });
 
+// properties row (snake_case) -> prop (camelCase UI state). Reverse of propToRow.
+// Used only when a reviewer opens an audit for reading; the capture flow never
+// needs it, because it owns the prop state it just authored.
+const rowToProp = (row) => ({
+  name: row.name || '', city: row.city || '', country: row.country || '',
+  chain: !!row.chain, chainName: row.chain_name || '',
+  category: row.category || '4★', roomCount: row.room_count != null ? String(row.room_count) : '',
+  roomTypes: row.room_types || [],
+  hasPool: !!row.has_pool, poolCapacity: row.pool_capacity != null ? String(row.pool_capacity) : '',
+  poolCount: row.pool_count != null ? String(row.pool_count) : '1',
+  hasSpa: !!row.has_spa,
+  hasRestaurant: !!row.has_restaurant, fbCapacity: row.fb_capacity != null ? String(row.fb_capacity) : '',
+  menuVariety: row.menu_variety || '', menuComplexity: row.menu_complexity || '',
+  authenticCuisine: !!row.authentic_cuisine, hasWineList: !!row.has_wine_list,
+  shiftCount: row.shift_count || '3', rotationPattern: row.rotation_pattern || '', shiftTimes: row.shift_times || {},
+});
+
+const fmtDate = (d) => {
+  if (!d) return '';
+  try { return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }); }
+  catch (e) { return String(d); }
+};
+
 export default function AHPAudit() {
   const [screen, setScreen]               = useState('loading');
   const [session, setSession]             = useState(undefined); // undefined = not checked yet, null = signed out
@@ -253,6 +276,16 @@ export default function AHPAudit() {
   const [auditTier, setAuditTier]         = useState('full'); // desk | spot | full
   const [publishState, setPublishState]   = useState('idle'); // idle | saving | done | error
 
+  // ---------- reviewer (read-only external access) ----------
+  // profile is the caller's own auditors row. The database is the security
+  // authority; this only decides what the UI offers.
+  const [profile, setProfile]             = useState(undefined); // undefined = not loaded
+  const [auditsList, setAuditsList]       = useState([]);
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseError, setBrowseError]     = useState(false);
+  const [reviewAuditId, setReviewAuditId] = useState(null);
+  const [reviewMeta, setReviewMeta]       = useState(null); // { ref, date, status, tier }
+
   const shifts = (SHIFT_SYSTEMS[prop.shiftCount] || SHIFT_SYSTEMS['3']).shifts.map(s => ({ ...s, time: (prop.shiftTimes && prop.shiftTimes[s.id]) || s.time }));
 
   // ---------- auth ----------
@@ -261,6 +294,48 @@ export default function AHPAudit() {
     const { data: sub } = supabase.auth.onAuthStateChange((_event, sess) => setSession(sess));
     return () => sub.subscription.unsubscribe();
   }, []);
+
+  // A reviewer can read their own auditors row (policy: id = auth.uid()).
+  // A signed-in account with no row, or an expired one, resolves to no role.
+  useEffect(() => {
+    if (!session) { setProfile(session === null ? null : undefined); return; }
+    let cancelled = false;
+    supabase.from('auditors').select('role, access_expires_at').eq('id', session.user.id).maybeSingle()
+      .then(({ data }) => { if (!cancelled) setProfile(data || null); })
+      .catch(() => { if (!cancelled) setProfile(null); });
+    return () => { cancelled = true; };
+  }, [session]);
+
+  const role         = profile && profile.role ? profile.role : null;
+  const isReviewer   = role === 'reviewer';
+  const readOnly     = isReviewer;
+  const expiresAt    = profile && profile.access_expires_at ? profile.access_expires_at : null;
+  // Expiry is enforced by the database. This only picks the right empty state
+  // so the reviewer sees a sentence instead of an empty list.
+  const accessExpired = !!(expiresAt && new Date(expiresAt).getTime() <= Date.now());
+
+  // A reviewer never enters setup, capture or publish. With no audit open they
+  // are always on the browse list.
+  useEffect(() => {
+    if (!isReviewer) return;
+    if (screen === 'setup' || screen === 'finish') { setScreen('review'); return; }
+    if (!reviewAuditId && screen !== 'review' && screen !== 'login') setScreen('review');
+  }, [isReviewer, reviewAuditId, screen]);
+
+  // Audit list for the reviewer browse screen. RLS returns every audit for a
+  // reviewer and only published ones for anybody else, so this needs no filter.
+  useEffect(() => {
+    if (screen !== 'review' || !session || !isReviewer) return;
+    setBrowseLoading(true); setBrowseError(false);
+    supabase.from('audits')
+      .select('id, ref, date, status, tier, property_id, properties(name, city, country)')
+      .order('date', { ascending: false })
+      .then(({ data, error }) => {
+        setBrowseLoading(false);
+        if (error) { setBrowseError(true); return; }
+        setAuditsList(data || []);
+      });
+  }, [screen, session, isReviewer]);
 
   const signIn = async () => {
     setAuthError('');
@@ -274,9 +349,56 @@ export default function AHPAudit() {
     }
   };
 
+  const openAuditForReview = async (row) => {
+    setScreen('loading');
+    try {
+      const { data: propRow, error: pErr } = await supabase
+        .from('properties').select('*').eq('id', row.property_id).single();
+      if (pErr) throw pErr;
+      const { data: items, error: iErr } = await supabase
+        .from('audit_items').select('*').eq('audit_id', row.id);
+      if (iErr) throw iErr;
+
+      const nextProp = rowToProp(propRow);
+      const nextAudit = {};
+      (items || []).forEach(r => {
+        nextAudit[r.item_id] = nextAudit[r.item_id] || {};
+        nextAudit[r.item_id][r.shift_id] = {
+          status: r.status, note: r.note, time: r.time, critical: r.critical,
+        };
+      });
+      const sys = SHIFT_SYSTEMS[nextProp.shiftCount] || SHIFT_SYSTEMS['3'];
+
+      setProp(nextProp);
+      setAudit(nextAudit);
+      setIds({ propertyId: row.property_id, auditId: row.id, auditRef: row.ref });
+      setReviewMeta({ ref: row.ref, date: row.date, status: row.status, tier: row.tier });
+      setReviewAuditId(row.id);
+      setActiveShiftId(sys.shifts[0].id);
+      setActiveSection(null);
+      setOpenNotes({});
+      setSyncState('synced');
+      setScreen('home');
+    } catch (e) {
+      setReviewAuditId(null);
+      setBrowseError(true);
+      setScreen('review');
+    }
+  };
+
+  const closeReviewAudit = () => {
+    setReviewAuditId(null);
+    setReviewMeta(null);
+    setIds({ propertyId: null, auditId: null, auditRef: null });
+    setAudit({});
+    setActiveSection(null);
+    setScreen('review');
+  };
+
   const signOut = async () => {
     await supabase.auth.signOut();
     setAuthEmail(''); setAuthPassword('');
+    setProfile(null); setAuditsList([]); setReviewAuditId(null); setReviewMeta(null);
     setScreen('login');
   };
 
@@ -330,7 +452,7 @@ export default function AHPAudit() {
 
   // creates (or reuses) the property + audit rows in Supabase once the auditor hits BEGIN AUDIT
   const ensureRemoteAudit = async () => {
-    if (!session) return ids;
+    if (!session || readOnly) return ids;
     try {
       const userId = session.user.id;
       await supabase.from('auditors').upsert({ id: userId, name: session.user.email }, { onConflict: 'id' });
@@ -367,7 +489,7 @@ export default function AHPAudit() {
   };
 
   const pushItem = async (auditId, itemId, shiftId, patch) => {
-    if (!session || !auditId) return;
+    if (!session || !auditId || readOnly) return;
     const meta = ITEM_INDEX[itemId];
     if (!meta) return;
     try {
@@ -445,7 +567,7 @@ export default function AHPAudit() {
   };
 
   const publishAudit = async (summary, tier) => {
-    if (!ids.auditId) return { ok: false, reason: 'no-audit' };
+    if (!ids.auditId || readOnly) return { ok: false, reason: 'no-audit' };
     const failures = getCriticalFailures();
     try {
       const { error } = await supabase.from('audits').update({
@@ -494,6 +616,24 @@ export default function AHPAudit() {
   const card = (extra = {}) => ({ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '12px', padding: '18px 20px', marginBottom: '10px', ...extra });
   const lbl = { fontSize: '11px', fontWeight: '600', letterSpacing: '0.1em', textTransform: 'uppercase', color: C.muted, marginBottom: '8px', display: 'block' };
   const inp = { width: '100%', background: C.surface2, border: `1px solid ${C.border}`, borderRadius: '8px', padding: '11px 14px', color: C.text, fontSize: '15px', outline: 'none', boxSizing: 'border-box' };
+
+  // Persistent, quiet mode indicator. Same palette and letter-spacing as the
+  // existing eyebrow labels; no new colour, no banner.
+  const ReviewBar = () => (
+    <div style={{
+      background: C.surface2, borderBottom: `1px solid ${C.border}`,
+      padding: '7px 16px', display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap',
+    }}>
+      <span style={{ fontSize: '10px', fontWeight: '700', letterSpacing: '0.14em', color: C.gold }}>
+        READ-ONLY REVIEW ACCESS
+      </span>
+      {expiresAt && !accessExpired && (
+        <span style={{ fontSize: '10px', color: C.muted, letterSpacing: '0.04em' }}>
+          Review access until {fmtDate(expiresAt)}
+        </span>
+      )}
+    </div>
+  );
 
   const ShiftBar = () => (
     <div style={{ background: C.surface2, borderBottom: `1px solid ${C.border}`, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: '8px', overflowX: 'auto' }}>
@@ -746,6 +886,86 @@ export default function AHPAudit() {
     );
   }
 
+  // ---------- reviewer: browse ----------
+  if (screen === 'review') {
+    return (
+      <div style={appStyle}>
+        <div style={headerStyle}>
+          <span style={logoStyle}>A · H · P</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            {session && (
+              <span style={{ fontSize: '11px', color: C.dim, maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={session.user.email}>
+                {session.user.email}
+              </span>
+            )}
+            <button onClick={signOut} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: '12px', padding: 0 }}>Sign out</button>
+          </div>
+        </div>
+        <ReviewBar />
+        <div style={bodyStyle}>
+          {accessExpired ? (
+            <div style={{ padding: '48px 0', textAlign: 'center' }}>
+              <div style={{ fontSize: '15px', fontWeight: '600', marginBottom: '10px' }}>Your review access is no longer active.</div>
+              <div style={{ fontSize: '13px', color: C.dim, lineHeight: '1.6' }}>Please contact Specula if you believe this is an error.</div>
+            </div>
+          ) : (
+            <>
+              <div style={{ marginBottom: '20px' }}>
+                <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>AUDIT REVIEW</div>
+                <h1 style={{ fontSize: '19px', fontWeight: '700', margin: '0 0 3px' }}>All audits</h1>
+                <div style={{ fontSize: '12px', color: C.dim }}>
+                  {browseLoading ? 'Loading…' : `${auditsList.length} audit${auditsList.length === 1 ? '' : 's'}`}
+                </div>
+              </div>
+
+              {browseError && (
+                <div style={{ padding: '32px 0', textAlign: 'center' }}>
+                  <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '8px' }}>Those audits could not be loaded.</div>
+                  <div style={{ fontSize: '13px', color: C.dim }}>Please contact Specula if this continues.</div>
+                </div>
+              )}
+
+              {!browseLoading && !browseError && auditsList.length === 0 && (
+                <div style={{ padding: '32px 0', textAlign: 'center' }}>
+                  <div style={{ fontSize: '14px', fontWeight: '600', marginBottom: '8px' }}>No audits are available to review.</div>
+                  <div style={{ fontSize: '13px', color: C.dim }}>Please contact Specula if you were expecting to see audits here.</div>
+                </div>
+              )}
+
+              {!browseError && auditsList.map(a => {
+                const p = a.properties || {};
+                const place = [p.city, p.country].filter(Boolean).join(', ');
+                const published = a.status === 'published';
+                return (
+                  <div key={a.id} onClick={() => openAuditForReview(a)}
+                    style={card({ display: 'flex', alignItems: 'center', gap: '14px', cursor: 'pointer' })}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: '10px', color: C.muted, letterSpacing: '0.08em', fontWeight: '600' }}>{a.ref}</span>
+                        <span style={{
+                          fontSize: '10px', fontWeight: '600', letterSpacing: '0.04em', padding: '1px 6px', borderRadius: '4px',
+                          color: published ? '#4DC87A' : C.dim,
+                          background: published ? 'rgba(77,200,122,0.12)' : 'transparent',
+                          border: `1px solid ${published ? 'rgba(77,200,122,0.35)' : C.border}`,
+                        }}>{published ? 'Published' : 'Draft'}</span>
+                        {a.tier && <span style={{ fontSize: '10px', color: C.muted, letterSpacing: '0.04em' }}>{a.tier}</span>}
+                      </div>
+                      <div style={{ fontWeight: '600', fontSize: '14px', marginBottom: '3px' }}>{p.name || 'Unnamed property'}</div>
+                      <div style={{ fontSize: '12px', color: C.dim }}>
+                        {place}{place && a.date ? ' · ' : ''}{fmtDate(a.date)}
+                      </div>
+                    </div>
+                    <span style={{ color: C.muted, fontSize: '20px', flexShrink: 0 }}>›</span>
+                  </div>
+                );
+              })}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   if (screen === 'home') {
     const { total, done } = getOverallProgress();
     const pct = total ? Math.round((done / total) * 100) : 0;
@@ -763,17 +983,29 @@ export default function AHPAudit() {
             <span style={{ fontSize: '10px', fontWeight: '600', letterSpacing: '0.06em', color: !session ? C.muted : syncState === 'synced' ? '#4DC87A' : syncState === 'error' ? C.warn : C.muted }}>
               {!session ? 'OFFLINE' : syncState === 'synced' ? 'SYNCED' : syncState === 'error' ? 'SYNC ERROR' : 'LOCAL'}
             </span>
-            <button onClick={() => setScreen('setup')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Edit</button>
+            {readOnly ? (
+              <button onClick={closeReviewAudit} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>All audits</button>
+            ) : (
+              <button onClick={() => setScreen('setup')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Edit</button>
+            )}
             {session && (
               <button onClick={signOut} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: '12px', padding: 0 }}>Sign out</button>
             )}
           </div>
         </div>
+        {readOnly && <ReviewBar />}
         <ShiftBar />
         <div style={bodyStyle}>
           <div style={{ marginBottom: '20px' }}>
             <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>{prop.category} · {prop.city}{prop.country ? ', ' + prop.country : ''}</div>
             <h1 style={{ fontSize: '19px', fontWeight: '700', margin: '0 0 3px' }}>{prop.name}</h1>
+            {readOnly && reviewMeta && (
+              <div style={{ fontSize: '11px', color: C.muted, letterSpacing: '0.06em', marginBottom: '4px' }}>
+                {reviewMeta.ref}{reviewMeta.date ? ' · ' + fmtDate(reviewMeta.date) : ''}
+                {reviewMeta.status ? ' · ' + (reviewMeta.status === 'published' ? 'Published' : 'Draft') : ''}
+                {reviewMeta.tier ? ' · ' + reviewMeta.tier : ''}
+              </div>
+            )}
             <div style={{ fontSize: '12px', color: C.dim }}>
               {prop.chain ? (prop.chainName || 'Chain') : 'Independent'} · {prop.roomCount} rooms{prop.roomTypes.length ? ' (' + prop.roomTypes.join(', ') + ')' : ''} · {(SHIFT_SYSTEMS[prop.shiftCount] || SHIFT_SYSTEMS['3']).label}{prop.rotationPattern ? ' · ' + prop.rotationPattern : ''}
             </div>
@@ -815,9 +1047,11 @@ export default function AHPAudit() {
             );
           })}
 
-          <button onClick={() => setScreen('finish')} style={{ width: '100%', marginTop: '8px', padding: '14px', borderRadius: '10px', border: `1px solid ${C.goldBorder}`, background: 'transparent', color: C.gold, fontSize: '13px', fontWeight: '700', letterSpacing: '0.05em', cursor: 'pointer' }}>
-            FINISH AUDIT →
-          </button>
+          {!readOnly && (
+            <button onClick={() => setScreen('finish')} style={{ width: '100%', marginTop: '8px', padding: '14px', borderRadius: '10px', border: `1px solid ${C.goldBorder}`, background: 'transparent', color: C.gold, fontSize: '13px', fontWeight: '700', letterSpacing: '0.05em', cursor: 'pointer' }}>
+              FINISH AUDIT →
+            </button>
+          )}
         </div>
       </div>
     );
@@ -925,6 +1159,7 @@ export default function AHPAudit() {
           <span style={logoStyle}>A · H · P</span>
           <div style={{ width: '32px' }} />
         </div>
+        {readOnly && <ReviewBar />}
         <ShiftBar />
         <div style={bodyStyle}>
           <div style={{ marginBottom: '22px' }}>
@@ -947,13 +1182,23 @@ export default function AHPAudit() {
                     <span style={{ fontSize: '10px', color: C.muted, letterSpacing: '0.08em', fontWeight: '600' }}>{item.id}</span>
                     {!applicable && <span style={{ fontSize: '10px', fontWeight: '600', color: C.gold, background: C.goldBg, border: `1px solid ${C.goldBorder}`, padding: '1px 6px', borderRadius: '4px' }}>{item.minStars === 6 ? 'Ultra only' : '5★+'}</span>}
                     {inconsistent && <span style={{ fontSize: '10px', fontWeight: '600', color: C.warn, background: C.warnBg, border: '1px solid rgba(245,166,35,0.3)', padding: '1px 6px', borderRadius: '4px' }}>Inconsistent across shifts</span>}
-                    <button onClick={() => toggleCritical(item.id)} style={{
-                      fontSize: '10px', fontWeight: '700', letterSpacing: '0.04em', cursor: 'pointer',
-                      color: activeData.critical ? '#E05555' : C.muted,
-                      background: activeData.critical ? 'rgba(224,85,85,0.12)' : 'transparent',
-                      border: `1px solid ${activeData.critical ? 'rgba(224,85,85,0.4)' : C.border}`,
-                      padding: '1px 6px', borderRadius: '4px',
-                    }}>⚑ {activeData.critical ? 'Critical' : 'Flag critical'}</button>
+                    {readOnly ? (
+                      activeData.critical ? (
+                        <span style={{
+                          fontSize: '10px', fontWeight: '700', letterSpacing: '0.04em',
+                          color: '#E05555', background: 'rgba(224,85,85,0.12)',
+                          border: '1px solid rgba(224,85,85,0.4)', padding: '1px 6px', borderRadius: '4px',
+                        }}>⚑ Critical</span>
+                      ) : null
+                    ) : (
+                      <button onClick={() => toggleCritical(item.id)} style={{
+                        fontSize: '10px', fontWeight: '700', letterSpacing: '0.04em', cursor: 'pointer',
+                        color: activeData.critical ? '#E05555' : C.muted,
+                        background: activeData.critical ? 'rgba(224,85,85,0.12)' : 'transparent',
+                        border: `1px solid ${activeData.critical ? 'rgba(224,85,85,0.4)' : C.border}`,
+                        padding: '1px 6px', borderRadius: '4px',
+                      }}>⚑ {activeData.critical ? 'Critical' : 'Flag critical'}</button>
+                    )}
                     {activeData.time && <span style={{ fontSize: '10px', color: C.muted, marginLeft: 'auto' }}>{activeData.time}</span>}
                   </div>
                   <div style={{ fontSize: '14px', fontWeight: '500', lineHeight: '1.45' }}>{item.label}</div>
@@ -980,6 +1225,19 @@ export default function AHPAudit() {
                   </div>
                 )}
 
+                {readOnly ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: noteVisible ? '12px' : 0 }}>
+                    {cfg ? (
+                      <span style={{
+                        padding: '5px 12px', borderRadius: '7px',
+                        border: `1px solid ${cfg.color}`, background: cfg.bg, color: cfg.color,
+                        fontSize: '11px', fontWeight: '700', letterSpacing: '0.04em',
+                      }}>{cfg.label}</span>
+                    ) : (
+                      <span style={{ fontSize: '11px', color: C.muted, letterSpacing: '0.04em' }}>Not recorded</span>
+                    )}
+                  </div>
+                ) : (
                 <div style={{ display: 'flex', gap: '6px', marginBottom: noteVisible ? '12px' : 0 }}>
                   {Object.entries(STATUS).map(([key, scfg]) => {
                     const active = activeData.status === key;
@@ -995,8 +1253,15 @@ export default function AHPAudit() {
                     );
                   })}
                 </div>
+                )}
 
-                {applicable && activeData.status && activeData.status !== 'na' && (
+                {readOnly ? (
+                  activeData.note ? (
+                    <div style={{ background: C.surface2, border: `1px solid ${C.border}`, borderRadius: '7px', padding: '10px 12px', fontSize: '13px', color: C.text, lineHeight: '1.5', whiteSpace: 'pre-wrap' }}>
+                      {activeData.note}
+                    </div>
+                  ) : null
+                ) : (applicable && activeData.status && activeData.status !== 'na' && (
                   <>
                     {!noteVisible && (
                       <button onClick={() => setOpenNotes(p => ({ ...p, [item.id]: true }))} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: '12px', padding: '4px 0' }}>+ Add note</button>
@@ -1008,7 +1273,7 @@ export default function AHPAudit() {
                       />
                     )}
                   </>
-                )}
+                ))}
               </div>
             );
           })}
