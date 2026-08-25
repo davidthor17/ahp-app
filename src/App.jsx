@@ -282,7 +282,8 @@ export default function AHPAudit() {
   const [profile, setProfile]             = useState(undefined); // undefined = not loaded
   const [auditsList, setAuditsList]       = useState([]);
   const [browseLoading, setBrowseLoading] = useState(false);
-  const [browseError, setBrowseError]     = useState(false);
+  const [browseError, setBrowseError]     = useState(false); // the list failed to load
+  const [openError, setOpenError]         = useState(false); // one audit failed to open
   const [reviewAuditId, setReviewAuditId] = useState(null);
   const [reviewMeta, setReviewMeta]       = useState(null); // { ref, date, status, tier }
 
@@ -326,6 +327,8 @@ export default function AHPAudit() {
   // reviewer and only published ones for anybody else, so this needs no filter.
   useEffect(() => {
     if (screen !== 'review' || !session || !isReviewer) return;
+    // Deliberately does not touch openError: returning to this screen after a
+    // failed open would otherwise clear the message before it could be read.
     setBrowseLoading(true); setBrowseError(false);
     supabase.from('audits')
       .select('id, ref, date, status, tier, property_id, properties(name, city, country)')
@@ -350,6 +353,7 @@ export default function AHPAudit() {
   };
 
   const openAuditForReview = async (row) => {
+    setOpenError(false);
     setScreen('loading');
     try {
       const { data: propRow, error: pErr } = await supabase
@@ -381,7 +385,7 @@ export default function AHPAudit() {
       setScreen('home');
     } catch (e) {
       setReviewAuditId(null);
-      setBrowseError(true);
+      setOpenError(true);
       setScreen('review');
     }
   };
@@ -399,6 +403,7 @@ export default function AHPAudit() {
     await supabase.auth.signOut();
     setAuthEmail(''); setAuthPassword('');
     setProfile(null); setAuditsList([]); setReviewAuditId(null); setReviewMeta(null);
+    setOpenError(false); setBrowseError(false);
     setScreen('login');
   };
 
@@ -920,6 +925,13 @@ export default function AHPAudit() {
                   {browseLoading ? 'Loading…' : `${auditsList.length} audit${auditsList.length === 1 ? '' : 's'}`}
                 </div>
               </div>
+
+              {openError && (
+                <div style={{ marginBottom: '12px', padding: '12px 14px', borderRadius: '8px', background: C.warnBg, border: '1px solid rgba(245,166,35,0.25)' }}>
+                  <div style={{ fontSize: '13px', fontWeight: '600', color: C.warn, marginBottom: '3px' }}>That audit could not be opened.</div>
+                  <div style={{ fontSize: '12px', color: C.dim, lineHeight: '1.5' }}>Please try again. If it keeps happening, contact Specula.</div>
+                </div>
+              )}
 
               {browseError && (
                 <div style={{ padding: '32px 0', textAlign: 'center' }}>
