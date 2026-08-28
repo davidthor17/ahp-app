@@ -105,6 +105,11 @@ export default function AHPAudit() {
   });
   const [activeShiftId, setActiveShiftId] = useState('morning');
   const [activeSection, setActiveSection] = useState(null);
+  // Set when a section is opened from a finding, so the item can be scrolled to
+  // and briefly marked, and so the back arrow returns where the auditor came
+  // from instead of dropping them on the home screen.
+  const [focusItemId, setFocusItemId]     = useState(null);
+  const [sectionReturn, setSectionReturn] = useState(null);
   const [audit, setAudit]                 = useState({});
   const [openNotes, setOpenNotes]         = useState({});
   const [summaryDraft, setSummaryDraft]   = useState('');
@@ -482,16 +487,47 @@ export default function AHPAudit() {
     [frameworkResult, auditTier],
   );
 
-  const sectionLabels = useMemo(
-    () => SECTIONS.reduce((acc, s) => { acc[s.id] = s.label; return acc; }, {}),
-    [],
-  );
-
-  const openSectionFromFinding = (sectionId) => {
+  // Jump straight from a finding to the item that raised it: open its section,
+  // mark the item so it can be scrolled to, and remember the way back.
+  const openFinding = (sectionId, itemId) => {
     if (!SECTIONS.some(s => s.id === sectionId)) return;
     setActiveSection(sectionId);
+    setFocusItemId(itemId || null);
+    setSectionReturn(screen);
     setScreen('section');
   };
+
+  const leaveSection = () => {
+    const back = sectionReturn || 'home';
+    setFocusItemId(null);
+    setSectionReturn(null);
+    setScreen(back);
+  };
+
+  // Every screen starts at the top. Without this a section opened after
+  // scrolling through another one begins halfway down.
+  useEffect(() => {
+    if (focusItemId) return;
+    window.scrollTo(0, 0);
+  }, [screen, activeSection, focusItemId]);
+
+  // Land on the item that raised a finding. This has to run from an effect
+  // rather than a ref on the card: a ref fires while the list is still being
+  // inserted, so the page is too short to scroll and the call is wasted.
+  // scrollMarginTop on the card clears the sticky header.
+  useEffect(() => {
+    if (screen !== 'section' || !focusItemId) return;
+    const land = () => {
+      const el = document.getElementById(`item-${focusItemId}`);
+      if (!el) return;
+      try { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+      catch (e) { el.scrollIntoView(); }
+    };
+    const first = setTimeout(land, 30);
+    // Once the cards above have settled to their final height, land it exactly.
+    const settle = setTimeout(land, 320);
+    return () => { clearTimeout(first); clearTimeout(settle); };
+  }, [screen, focusItemId, activeSection]);
 
   const appStyle = { minHeight: '100vh', background: C.bg, color: C.text, fontFamily: '-apple-system, BlinkMacSystemFont, "Inter", sans-serif', fontSize: '15px' };
   const headerStyle = { background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '0 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: '54px', position: 'sticky', top: 0, zIndex: 100 };
@@ -976,8 +1012,7 @@ export default function AHPAudit() {
             result={frameworkResult}
             certification={frameworkCertification}
             palette={C}
-            sectionLabels={sectionLabels}
-            onOpenSection={openSectionFromFinding}
+            onOpenFinding={openFinding}
           />
         </div>
       </div>
@@ -1016,8 +1051,7 @@ export default function AHPAudit() {
             result={frameworkResult}
             certification={frameworkCertification}
             palette={C}
-            sectionLabels={sectionLabels}
-            onOpenSection={openSectionFromFinding}
+            onOpenFinding={openFinding}
           />
 
           {/* Legacy scoring. Still the number that publishAudit() writes and the
@@ -1099,7 +1133,7 @@ export default function AHPAudit() {
     return (
       <div style={appStyle}>
         <div style={headerStyle}>
-          <button onClick={() => setScreen('home')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '22px', lineHeight: 1, padding: 0 }}>&#8249;</button>
+          <button onClick={leaveSection} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '22px', lineHeight: 1, padding: 0 }}>&#8249;</button>
           <span style={logoStyle}>A · H · P</span>
           <div style={{ width: '32px' }} />
         </div>
@@ -1111,6 +1145,12 @@ export default function AHPAudit() {
             <div style={{ fontSize: '12px', color: C.dim }}>{prop.name} · {prop.category}</div>
           </div>
 
+          {sectionReturn && (
+            <button onClick={leaveSection} style={{ background: 'none', border: 'none', color: C.gold, cursor: 'pointer', fontSize: '12px', fontWeight: '600', letterSpacing: '0.04em', padding: '0 0 16px' }}>
+              &#8249; Back to {sectionReturn === 'finish' ? 'finish' : 'summary'}
+            </button>
+          )}
+
           {section.items.map(item => {
             const applicable = item.minStars <= rank;
             const activeData = getActiveData(item.id);
@@ -1118,9 +1158,19 @@ export default function AHPAudit() {
             const noteVisible = openNotes[item.id] || activeData.note;
             const inconsistent = isInconsistent(item.id);
             const anyDone = shifts.some(sh => getShiftData(item.id, sh.id).status);
+            const focused = focusItemId === item.id;
 
             return (
-              <div key={item.id} style={card({ opacity: applicable ? 1 : 0.45, borderColor: activeData.critical ? 'rgba(224,85,85,0.5)' : inconsistent ? 'rgba(245,166,35,0.4)' : (cfg ? cfg.border : C.border) })}>
+              <div
+                key={item.id}
+                id={`item-${item.id}`}
+                style={card({
+                  opacity: applicable ? 1 : 0.45,
+                  borderColor: focused ? C.gold : activeData.critical ? 'rgba(224,85,85,0.5)' : inconsistent ? 'rgba(245,166,35,0.4)' : (cfg ? cfg.border : C.border),
+                  boxShadow: focused ? `0 0 0 1px ${C.goldBorder}` : 'none',
+                  scrollMarginTop: '110px',
+                })}
+              >
                 <div style={{ marginBottom: '12px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '7px', marginBottom: '5px', flexWrap: 'wrap' }}>
                     <span style={{ fontSize: '10px', color: C.muted, letterSpacing: '0.08em', fontWeight: '600' }}>{item.id}</span>
