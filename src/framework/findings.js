@@ -45,10 +45,19 @@ export function stepUp(severity) {
   return SEVERITY_LADDER[Math.min(i + 1, SEVERITY_LADDER.length - 1)];
 }
 
-/** The severity a status produces for an item, before any escalation. */
+/**
+ * The severity a status produces for an item, before any escalation.
+ *
+ * A Partial steps the severity down one rung, with one exception: a Critical
+ * item stays Critical. A hazard partly present is still present, and a door
+ * that only sometimes locks is an unlocked door. Under the old blanket
+ * step-down, three Critical failures recorded Partial still reached Elite.
+ */
 export function derivedSeverity(status, defaultSeverity) {
   if (status === STATUS.MISSED) return defaultSeverity;
-  if (status === STATUS.PARTIAL) return stepDown(defaultSeverity);
+  if (status === STATUS.PARTIAL) {
+    return defaultSeverity === SEVERITY.CRITICAL ? SEVERITY.CRITICAL : stepDown(defaultSeverity);
+  }
   return null;
 }
 
@@ -144,11 +153,15 @@ export function deriveFinding(item, status, escalation = null) {
     );
   }
 
-  // The auditor may move the finding one rung either way within Minor..Critical.
-  const allowed = new Set([base, stepUp(base), stepDown(base)]);
+  // The auditor may raise a finding but never lower one. Escalating to Zero
+  // Tolerance costs an eligible item, a Missed status, a note and a photograph;
+  // removing a Critical used to cost nothing at all. There is deliberately no
+  // downgrade path: if one is ever needed for a genuine edge case it has to be
+  // designed with its own evidence requirement and audit trail.
+  const allowed = new Set([base, stepUp(base)]);
   if (!allowed.has(escalation.severity)) {
     throw new InvalidEscalationError(
-      `severity "${escalation.severity}" on ${item.id} is more than one step from the derived "${base}"`,
+      `severity "${escalation.severity}" on ${item.id} is not permitted: a finding may be raised from the derived "${base}" but never lowered`,
       { itemId: item.id, derived: base, requested: escalation.severity },
     );
   }

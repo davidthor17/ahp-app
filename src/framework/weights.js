@@ -27,13 +27,44 @@ export const STATUS = Object.freeze({
 
 export const STATUSES = Object.freeze(Object.values(STATUS));
 
-// Value contributed to the numerator. N/A has no value because it leaves the
-// scope entirely: it is removed from the numerator AND the denominator.
+// Value contributed to the numerator. N/A has no value: what it does to the
+// denominators depends on which kind of N/A it is, see NA_REASON below.
 export const STATUS_VALUE = Object.freeze({
   [STATUS.MET]: 1,
   [STATUS.PARTIAL]: 0.5,
   [STATUS.MISSED]: 0,
 });
+
+// ── Not applicable ──────────────────────────────────────────────────────────
+// N/A carried two incompatible meanings and the engine modelled only one, which
+// made it a free eraser for poor performance. It is now two outcomes.
+//
+//   structural     the property does not have this at all, so the item leaves
+//                  the audit entirely. Capped, because this is the erasing kind.
+//   observational  it exists but could not be assessed on this stay. The item
+//                  stays in scope and counts as unassessed, so coverage falls.
+//                  Uncapped, because the coverage floors already handle it.
+export const NA_REASON = Object.freeze({
+  NOT_OFFERED: 'not_offered',   // the property does not provide this service
+  NOT_PRESENT: 'not_present',   // the facility or feature does not exist
+  NOT_OBSERVED: 'not_observed', // available, but not seen on this stay
+});
+
+export const NA_REASONS = Object.freeze(Object.values(NA_REASON));
+
+export const STRUCTURAL_NA_REASONS = Object.freeze([
+  NA_REASON.NOT_OFFERED,
+  NA_REASON.NOT_PRESENT,
+]);
+
+// An N/A recorded before reasons existed. Read as observational, the
+// conservative choice: it can only lower a historical score, never raise one.
+export const LEGACY_NA_REASON = NA_REASON.NOT_OBSERVED;
+
+// Structural N/A may not exceed this share of applicable weight. Measured by
+// weight rather than item count so that erasing Foundation items costs more
+// than erasing Distinction items. Breaching it blocks certification outright.
+export const STRUCTURAL_NA_CAP_PCT = 5;
 
 // Statuses that count as "the auditor made a determination that is scored".
 export const GRADED_STATUSES = Object.freeze([STATUS.MET, STATUS.PARTIAL, STATUS.MISSED]);

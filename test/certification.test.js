@@ -228,14 +228,24 @@ test('a single Critical finding blocks certification at every level', () => {
   assert.ok(r.reasons.some((x) => /1 Critical finding recorded/.test(x)));
 });
 
-test('a Partial on a Critical item becomes Major and does not block', () => {
+test('a Partial on a Critical item stays Critical and blocks', () => {
+  // Approved Phase 4B. Under the old blanket step-down this reached Elite.
   const graded = setStatus(gradeAll(FULL_5_STAR, 'met'), ['BTH-01'], 'partial');
   const s = score(graded, FULL_5_STAR);
   const r = certify(s, FULL);
-  assert.equal(s.findingCounts.critical, 0);
-  assert.equal(s.findingCounts.major, 1);
-  assert.equal(r.blockers.length, 0);
-  assert.equal(r.level, 'elite', 'a single partial on one item should not cost certification');
+  assert.equal(s.findingCounts.critical, 1);
+  assert.equal(s.findingCounts.major, 0);
+  assert.equal(r.level, 'none');
+  assert.ok(r.blockers.some((b) => b.includes('BTH-01')), r.blockers.join(' | '));
+});
+
+test('a Partial on a Major item still steps down to Minor', () => {
+  // Only the Critical case changed. ARR-01 is Foundation, default Major.
+  const graded = setStatus(gradeAll(FULL_5_STAR, 'met'), ['ARR-01'], 'partial');
+  const s = score(graded, FULL_5_STAR);
+  assert.equal(s.findingCounts.major, 0);
+  assert.equal(s.findingCounts.minor, 1);
+  assert.equal(certify(s, FULL).level, 'elite');
 });
 
 test('v1 has no Major cap: Major findings are counted, not blocking', () => {
@@ -287,5 +297,6 @@ test('an ungraded audit produces no certification and says why', () => {
   const r = certify(score({}, FULL_5_STAR), FULL);
   assert.equal(r.level, 'none');
   assert.equal(r.eligible, false);
-  assert.match(r.reasons[0], /No graded items/);
+  assert.match(r.reasons[0], /No items have been assessed yet/);
+  assert.equal(r.outcome, 'NO_ITEMS_GRADED');
 });

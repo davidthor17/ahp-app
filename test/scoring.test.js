@@ -38,9 +38,10 @@ test('Missed is worth zero and still occupies the denominator', () => {
   assert.equal(r.weights.graded, r.weights.inScope);
 });
 
-test('N/A leaves both the numerator and the denominator', () => {
+test('structural N/A leaves both the numerator and the denominator', () => {
   const met = { 'RM-01': { day: { status: 'met' } } };          // weight 3
-  const withNa = { ...met, 'RM-06': { day: { status: 'na' } } }; // weight 2
+  // Structural: the property does not provide this, so the item leaves.
+  const withNa = { ...met, 'RM-06': { day: { status: 'na', naReason: 'not_offered' } } }; // weight 2
 
   const a = score(met, FULL_5_STAR);
   const b = score(withNa, FULL_5_STAR);

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { SECTIONS } from "./auditItems.js";
 import AuditSummary from "./AuditSummary.jsx";
@@ -7,6 +7,9 @@ import AuditSummary from "./AuditSummary.jsx";
 // Phase 2; it does not replace it, and nothing it produces is persisted.
 import { score as frameworkScore } from "./framework/scoring.js";
 import { certify as frameworkCertify } from "./framework/certification.js";
+import { NA_REASON } from "./framework/weights.js";
+import { buildSnapshot, resolveScoringProfile } from "./framework/snapshot.js";
+import { itemChangeIsMaterial, trailEntry } from "./framework/trail.js";
 
 // Settings → API in your Supabase project → Project URL + anon public key.
 // Safe to expose in client code — access is governed by the RLS policies
@@ -112,6 +115,16 @@ export default function AHPAudit() {
   const [sectionReturn, setSectionReturn] = useState(null);
   const [audit, setAudit]                 = useState({});
   const [openNotes, setOpenNotes]         = useState({});
+  // Item awaiting an N/A reason, and the frozen scoring basis for this audit.
+  const [naPrompt, setNaPrompt]           = useState(null);
+  const [snapshot, setSnapshot]           = useState(null);
+  // Trail entries wait here until the columns to receive them exist. Queued in
+  // state and persisted with the audit so an offline auditor still leaves one.
+  const [trailQueue, setTrailQueue]       = useState([]);
+  // persist() is a stable callback, so it reads these through refs rather than
+  // closing over state that would be stale by the time it runs.
+  const snapshotRef                       = useRef(null);
+  const trailRef                          = useRef([]);
   const [summaryDraft, setSummaryDraft]   = useState('');
   const [auditTier, setAuditTier]         = useState('full'); // desk | spot | full
   const [publishState, setPublishState]   = useState('idle'); // idle | saving | done | error
@@ -257,6 +270,11 @@ export default function AHPAudit() {
           if (data.prop) setProp(data.prop);
           if (data.audit) setAudit(data.audit);
           if (data.ids) setIds(data.ids);
+          // A snapshot taken on a previous session is the audit's scoring basis
+          // and must survive a reload, or the basis would silently re-form
+          // from whatever the property record says now.
+          if (data.snapshot) setSnapshot(data.snapshot);
+          if (data.trailQueue) setTrailQueue(data.trailQueue);
           const sys = SHIFT_SYSTEMS[data.prop && data.prop.shiftCount] || SHIFT_SYSTEMS['3'];
           setActiveShiftId(sys.shifts[0].id);
           setScreen(data.prop && data.prop.name ? 'home' : 'setup');
@@ -295,7 +313,7 @@ export default function AHPAudit() {
   }, [session, ids.auditId]);
 
   const persist = useCallback(async (p, a, i) => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ prop: p, audit: a, ids: i })); } catch(e) {}
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ prop: p, audit: a, ids: i, snapshot: snapshotRef.current, trailQueue: trailRef.current })); } catch(e) {}
   }, []);
 
   // creates (or reuses) the property + audit rows in Supabase once the auditor hits BEGIN AUDIT
@@ -354,14 +372,35 @@ export default function AHPAudit() {
   const updateShiftTime = (shiftId, time) => setProp(p => ({ ...p, shiftTimes: { ...p.shiftTimes, [shiftId]: time } }));
   const toggleRoomType = (rt) => setProp(p => ({ ...p, roomTypes: p.roomTypes.includes(rt) ? p.roomTypes.filter(x => x !== rt) : [...p.roomTypes, rt] }));
 
-  const setStatus = (itemId, status) => {
+  const setStatus = (itemId, status, naReason = null) => {
     const prev = audit[itemId] || {};
     const shiftPrev = prev[activeShiftId] || {};
     const time = shiftPrev.time || nowTime();
-    const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, status, time } } };
+    // A reason only belongs to an N/A. Moving off N/A clears it, so a stale
+    // reason can never sit behind a graded status.
+    const reason = status === 'na' ? (naReason || shiftPrev.naReason || null) : null;
+
+    // Recorded before the state changes, so the trail can say what it was.
+    const change = itemChangeIsMaterial(
+      { status: shiftPrev.status || null, naReason: shiftPrev.naReason || null },
+      { status, naReason: reason },
+    );
+
+    const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, status, time, naReason: reason } } };
     setAudit(updated); persist(prop, updated, ids);
+    if (change) {
+      recordTrail({
+        action: change.action, itemId, field: 'status',
+        from: shiftPrev.status || null, to: status === 'na' && reason ? `na:${reason}` : status,
+      });
+    }
     if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status, time, note: shiftPrev.note || null, critical: !!shiftPrev.critical });
   };
+
+  // Opens the reason sheet rather than writing N/A directly. Every other status
+  // is still one tap; the extra step lands only where the abuse was.
+  const requestNa = (itemId) => setNaPrompt(itemId);
+  const confirmNa = (itemId, naReason) => { setStatus(itemId, 'na', naReason); setNaPrompt(null); };
 
   const setNote = (itemId, note) => {
     const prev = audit[itemId] || {};
@@ -465,24 +504,53 @@ export default function AHPAudit() {
   //
   // Scored against the whole catalogue. Phase 3B put the five Foundation items
   // into auditItems.js, so the checklist an auditor captures and the catalogue
-  // the framework scores are now the same 147 items and no scope override is
-  // needed: coverage can reach 100%.
-  const frameworkProfile = useMemo(() => ({
-    category: prop.category,
-    hasRestaurant: prop.hasRestaurant,
-    hasPool: prop.hasPool,
-    hasSpa: prop.hasSpa,
-  }), [prop.category, prop.hasRestaurant, prop.hasPool, prop.hasSpa]);
+  // the framework scores are the same 147 items and coverage can reach 100%.
+  //
+  // Phase 4B: scoring reads the snapshot, not the live property. Once grading
+  // starts, editing the property record can no longer move this audit.
+  const scoringBasis = useMemo(
+    () => resolveScoringProfile(snapshot, prop),
+    [snapshot, prop],
+  );
 
   const frameworkResult = useMemo(
-    () => frameworkScore(audit, frameworkProfile),
-    [audit, frameworkProfile],
+    () => frameworkScore(audit, scoringBasis.profile, { scopeSections: scoringBasis.scopeSections }),
+    [audit, scoringBasis],
   );
 
   const frameworkCertification = useMemo(
     () => frameworkCertify(frameworkResult, { auditType: auditTier }),
     [frameworkResult, auditTier],
   );
+
+  // The snapshot is taken at the first graded item rather than at audit
+  // creation, because setup is iterative and an auditor should be able to
+  // correct the profile before starting. After it, the basis is fixed.
+  useEffect(() => {
+    if (snapshot) return;
+    const hasAnyGrade = Object.values(audit).some(
+      (byShift) => Object.values(byShift || {}).some((e) => e && e.status),
+    );
+    if (!hasAnyGrade || !prop.name) return;
+    setSnapshot(buildSnapshot(prop, { auditType: auditTier, lockedAt: new Date().toISOString() }));
+  }, [audit, prop, auditTier, snapshot]);
+
+  // Queued rather than written: the columns and policies for the trail are
+  // prepared but not yet applied, so nothing is sent to Supabase.
+  // Keep the refs and the stored copy in step with the state they mirror.
+  useEffect(() => {
+    snapshotRef.current = snapshot;
+    trailRef.current = trailQueue;
+    if (snapshot || trailQueue.length) persist(prop, audit, ids);
+  }, [snapshot, trailQueue, persist, prop, audit, ids]);
+
+  const recordTrail = useCallback((entry) => {
+    setTrailQueue((q) => [...q, trailEntry({
+      auditId: ids.auditId,
+      actorId: session && session.user ? session.user.id : null,
+      ...entry,
+    })]);
+  }, [ids.auditId, session]);
 
   // Jump straight from a finding to the item that raised it: open its section,
   // mark the item so it can be scrolled to, and remember the way back.
@@ -1233,7 +1301,7 @@ export default function AHPAudit() {
                   {Object.entries(STATUS).map(([key, scfg]) => {
                     const active = activeData.status === key;
                     return (
-                      <button key={key} onClick={() => applicable && setStatus(item.id, key)} style={{
+                      <button key={key} onClick={() => applicable && (key === 'na' ? requestNa(item.id) : setStatus(item.id, key))} style={{
                         flex: 1, padding: '8px 4px', borderRadius: '7px',
                         border: `1px solid ${active ? scfg.color : C.border}`,
                         background: active ? scfg.bg : 'transparent',
@@ -1244,6 +1312,41 @@ export default function AHPAudit() {
                     );
                   })}
                 </div>
+                )}
+
+                {/* Why this item does not apply. One extra tap, only on N/A,
+                    because the two answers do very different things to the
+                    result and the auditor is the only one who knows which. */}
+                {naPrompt === item.id && !readOnly && (
+                  <div style={{ background: C.surface2, border: `1px solid ${C.border}`, borderRadius: '9px', padding: '12px 14px', marginBottom: '10px' }}>
+                    <div style={{ fontSize: '12px', color: C.dim, marginBottom: '10px' }}>Why does this not apply?</div>
+                    {[
+                      { id: NA_REASON.NOT_PRESENT, label: 'The property does not have it', hint: 'Left out of the audit entirely' },
+                      { id: NA_REASON.NOT_OFFERED, label: 'The property does not offer it', hint: 'Left out of the audit entirely' },
+                      { id: NA_REASON.NOT_OBSERVED, label: 'It exists, but I could not assess it', hint: 'Stays in the audit as unassessed' },
+                    ].map(opt => (
+                      <button key={opt.id} onClick={() => confirmNa(item.id, opt.id)} style={{
+                        display: 'block', width: '100%', textAlign: 'left', marginBottom: '7px',
+                        background: 'transparent', border: `1px solid ${C.border}`, borderRadius: '7px',
+                        padding: '10px 12px', cursor: 'pointer', color: C.text, fontFamily: 'inherit',
+                      }}>
+                        <div style={{ fontSize: '13px', fontWeight: '600' }}>{opt.label}</div>
+                        <div style={{ fontSize: '11px', color: C.muted, marginTop: '2px' }}>{opt.hint}</div>
+                      </button>
+                    ))}
+                    <button onClick={() => setNaPrompt(null)} style={{ background: 'none', border: 'none', color: C.dim, fontSize: '12px', cursor: 'pointer', padding: '4px 0 0' }}>Cancel</button>
+                  </div>
+                )}
+
+                {activeData.status === 'na' && activeData.naReason && naPrompt !== item.id && (
+                  <div style={{ fontSize: '11px', color: C.muted, marginBottom: '10px' }}>
+                    {activeData.naReason === NA_REASON.NOT_OBSERVED
+                      ? 'Not assessed on this stay'
+                      : 'Not part of this property'}
+                    {!readOnly && (
+                      <button onClick={() => requestNa(item.id)} style={{ background: 'none', border: 'none', color: C.gold, fontSize: '11px', cursor: 'pointer', padding: '0 0 0 8px' }}>Change</button>
+                    )}
+                  </div>
                 )}
 
                 {readOnly ? (

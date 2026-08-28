@@ -30,9 +30,10 @@ test('Missed raises a finding at the item default severity', () => {
   assert.equal(deriveFinding(minor, STATUS.MISSED).severity, SEVERITY.MINOR);
 });
 
-test('Partial on a Critical item becomes a Major finding', () => {
+test('Partial on a Critical item stays Critical', () => {
+  // Approved Phase 4B: a hazard partly present is still present.
   const finding = deriveFinding(critical, STATUS.PARTIAL);
-  assert.equal(finding.severity, SEVERITY.MAJOR);
+  assert.equal(finding.severity, SEVERITY.CRITICAL);
   assert.equal(finding.defaultSeverity, SEVERITY.CRITICAL);
   assert.equal(finding.escalated, false);
   assert.equal(finding.source, 'derived');
@@ -98,14 +99,16 @@ test('zeroToleranceProblems lists every unmet condition', () => {
   }).length, 0);
 });
 
-test('auditor may adjust one rung either way, but no further', () => {
-  // ARR-01 derives Major on Missed; Critical and Minor are one step away.
+test('auditor may raise a finding but never lower one', () => {
+  // ARR-01 derives Major on Missed. Raising to Critical is allowed.
   assert.equal(deriveFinding(major, STATUS.MISSED, { severity: SEVERITY.CRITICAL }).severity, SEVERITY.CRITICAL);
-  assert.equal(deriveFinding(major, STATUS.MISSED, { severity: SEVERITY.MINOR }).severity, SEVERITY.MINOR);
+  // Lowering has no path at all: removing a Critical used to cost nothing.
+  assert.throws(() => deriveFinding(major, STATUS.MISSED, { severity: SEVERITY.MINOR }), /never lowered/);
+  assert.throws(() => deriveFinding(critical, STATUS.MISSED, { severity: SEVERITY.MAJOR }), /never lowered/);
   // ARR-03 derives Minor; Critical is two steps away.
   assert.throws(
     () => deriveFinding(minor, STATUS.MISSED, { severity: SEVERITY.CRITICAL }),
-    /more than one step/,
+    /never lowered/,
   );
   assert.throws(
     () => deriveFinding(minor, STATUS.MISSED, { severity: 'apocalyptic' }),

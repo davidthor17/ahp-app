@@ -24,6 +24,22 @@ export {
   zeroToleranceProblems,
   InvalidEscalationError,
 } from './findings.js';
+export {
+  buildSnapshot,
+  resolveScoringProfile,
+  isUsableSnapshot,
+  snapshotDrift,
+  isFavourableChange,
+  isFavourableScopeChange,
+  FACILITY_FLAGS,
+} from './snapshot.js';
+export {
+  itemChangeIsMaterial,
+  severityChangeIsMaterial,
+  trailEntry,
+  snapshotTrailEntries,
+  TRAIL_ACTION,
+} from './trail.js';
 export { score } from './scoring.js';
 export { certify } from './certification.js';
 export { validateFramework, assertFrameworkValid } from './validate.js';

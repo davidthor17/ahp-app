@@ -24,9 +24,13 @@ import {
   STATUS_VALUE,
   GRADED_STATUSES,
   CLASS_WEIGHT,
+  WEIGHT_CLASS,
   WEIGHT_CLASSES,
   DIMENSIONS,
   SEVERITY,
+  STRUCTURAL_NA_REASONS,
+  LEGACY_NA_REASON,
+  STRUCTURAL_NA_CAP_PCT,
 } from './weights.js';
 import { applicableItems, rankOf } from './catalog.js';
 import { deriveFinding, worstStatus, InvalidEscalationError } from './findings.js';
@@ -74,6 +78,11 @@ export function score(graded = {}, profile = {}, options = {}) {
     const status = worstStatus(byShift);
     const na = status === STATUS.NA;
     const isGraded = GRADED_STATUSES.includes(status);
+    // A structural N/A takes the item out of the audit. An observational one
+    // leaves it in scope and unassessed, so it costs coverage like any other
+    // item nobody looked at. An N/A with no reason is read as observational.
+    const naReason = na ? (naReasonOf(byShift) || LEGACY_NA_REASON) : null;
+    const structural = na && STRUCTURAL_NA_REASONS.includes(naReason);
 
     entries.push({
       itemId: item.id,
@@ -83,6 +92,8 @@ export function score(graded = {}, profile = {}, options = {}) {
       weight: item.weight,
       status,
       na,
+      naReason,
+      structural,
       graded: isGraded,
       value: isGraded ? STATUS_VALUE[status] : 0,
     });
@@ -108,8 +119,13 @@ export function score(graded = {}, profile = {}, options = {}) {
 
   const applicableWeight = entries.reduce((a, e) => a + e.weight, 0);
   const naWeight = entries.reduce((a, e) => a + (e.na ? e.weight : 0), 0);
+  const structuralNaWeight = entries.reduce((a, e) => a + (e.structural ? e.weight : 0), 0);
+  const observedNaWeight = naWeight - structuralNaWeight;
   const gradedWeight = entries.reduce((a, e) => a + (e.graded ? e.weight : 0), 0);
-  const inScopeWeight = applicableWeight - naWeight;
+  // Only structural N/A leaves the coverage denominator. Observational N/A
+  // stays in it and therefore costs coverage, which is what stops N/A being a
+  // free eraser without punishing a property that genuinely has no spa.
+  const inScopeWeight = applicableWeight - structuralNaWeight;
   const { score: overall, numerator } = weightedScore(entries);
 
   const findingCounts = countBy(findings);
@@ -128,18 +144,35 @@ export function score(graded = {}, profile = {}, options = {}) {
     overallOfApplicable: inScopeWeight ? round1((numerator / inScopeWeight) * 100) : null,
     coverage: inScopeWeight ? round1((gradedWeight / inScopeWeight) * 100) : 0,
     naShare: applicableWeight ? round1((naWeight / applicableWeight) * 100) : 0,
+    // Measured against the full applicable pool, so erasing items cannot also
+    // shrink the yardstick the cap is judged by.
+    structuralNaShare: applicableWeight ? round1((structuralNaWeight / applicableWeight) * 100) : 0,
+    structuralNaCapExceeded: applicableWeight
+      ? (structuralNaWeight / applicableWeight) * 100 > STRUCTURAL_NA_CAP_PCT
+      : false,
+    structuralNaItems: entries.filter((e) => e.structural).map((e) => e.itemId),
+    structuralNaFoundationItems: entries
+      .filter((e) => e.structural && e.weightClass === WEIGHT_CLASS.FOUNDATION)
+      .map((e) => e.itemId),
 
     weights: {
       applicable: applicableWeight,
       inScope: inScopeWeight,
       graded: gradedWeight,
       na: naWeight,
+      structuralNa: structuralNaWeight,
+      observedNa: observedNaWeight,
       ungraded: inScopeWeight - gradedWeight,
     },
 
     byClass: subscores(entries, 'weightClass', WEIGHT_CLASSES),
     byDimension: subscores(entries, 'dimension', DIMENSIONS),
     bySection: subscores(entries, 'sectionId', sectionIds),
+    assessment: assessmentOf(entries),
+    assessmentByClass: WEIGHT_CLASSES.reduce((acc, c) => {
+      acc[c] = assessmentOf(entries.filter((e) => e.weightClass === c));
+      return acc;
+    }, {}),
 
     findings,
     findingCounts,
@@ -151,6 +184,8 @@ export function score(graded = {}, profile = {}, options = {}) {
       applicable: entries.length,
       graded: entries.filter((e) => e.graded).length,
       na: entries.filter((e) => e.na).length,
+      structuralNa: entries.filter((e) => e.structural).length,
+      observedNa: entries.filter((e) => e.na && !e.structural).length,
       ungraded: entries.filter((e) => !e.graded && !e.na).length,
     },
   };
@@ -170,6 +205,46 @@ function firstNote(byShift) {
     if (entry && typeof entry.note === 'string' && entry.note.trim()) return entry.note.trim();
   }
   return null;
+}
+
+/** The N/A reason recorded against an item, from whichever shift carries one. */
+function naReasonOf(byShift) {
+  if (!byShift) return null;
+  for (const entry of Object.values(byShift)) {
+    if (entry && entry.status === STATUS.NA && entry.naReason) return entry.naReason;
+  }
+  return null;
+}
+
+/**
+ * How much of a set of items was actually assessed, and what that means.
+ *
+ *   no_applicable  nothing in this set applies to the property
+ *   none_graded    it applies, and none of it was assessed
+ *   partial        some of it was assessed
+ *   complete       all of it was assessed
+ *
+ * Structural N/A leaves the set, so it neither counts as assessed nor as a gap.
+ */
+function assessmentOf(entries) {
+  const inScope = entries.filter((e) => !e.structural);
+  const applicableWeight = inScope.reduce((a, e) => a + e.weight, 0);
+  const gradedWeight = inScope.reduce((a, e) => a + (e.graded ? e.weight : 0), 0);
+
+  let state;
+  if (entries.length === 0 || applicableWeight === 0) state = 'no_applicable';
+  else if (gradedWeight === 0) state = 'none_graded';
+  else if (gradedWeight < applicableWeight) state = 'partial';
+  else state = 'complete';
+
+  return {
+    state,
+    applicableWeight,
+    gradedWeight,
+    assessedShare: applicableWeight ? round1((gradedWeight / applicableWeight) * 100) : null,
+    itemsApplicable: inScope.length,
+    itemsGraded: inScope.filter((e) => e.graded).length,
+  };
 }
 
 const withObservation = (finding, observation) =>

@@ -25,6 +25,8 @@ import {
   NO_CERTIFICATION,
   DEFAULT_AUDIT_TYPE,
   SEVERITY,
+  WEIGHT_CLASS,
+  STRUCTURAL_NA_CAP_PCT,
 } from './weights.js';
 
 /**
@@ -48,9 +50,16 @@ export function certify(scoreResult, context = {}) {
   const zeroToleranceFindings = findings.filter((f) => f.severity === SEVERITY.ZERO_TOLERANCE);
   const majorFindings = findings.filter((f) => f.severity === SEVERITY.MAJOR);
 
+  // Structural N/A erases items from the audit, so beyond the cap the result is
+  // no longer a statement about the property. It blocks like a finding does.
+  const structuralNaBlocker = scoreResult.structuralNaCapExceeded
+    ? [`Too much of the audit was excluded as not applicable: ${scoreResult.structuralNaShare}% of the property, against a ${STRUCTURAL_NA_CAP_PCT}% limit`]
+    : [];
+
   const blockers = [
     ...zeroToleranceFindings.map((f) => `Zero Tolerance: ${f.itemId} ${f.label}`),
     ...criticalFindings.map((f) => `Critical finding: ${f.itemId} ${f.label}`),
+    ...structuralNaBlocker,
   ];
 
   // Highest level this audit could reach on eligibility alone, before scores.
@@ -67,16 +76,34 @@ export function certify(scoreResult, context = {}) {
     majorFindings: majorFindings.length,
   };
 
-  if (overall === null || foundation === null) {
+  // ── Assessment states, kept apart on purpose ─────────────────────────────
+  //
+  // These used to collapse into one branch that said "No graded items" even
+  // when ninety nine items had been graded. Each state now names itself, so an
+  // auditor is never sent looking for the wrong problem.
+  const overallAssessment = scoreResult.assessment || null;
+  const foundationAssessment = scoreResult.assessmentByClass
+    ? scoreResult.assessmentByClass[WEIGHT_CLASS.FOUNDATION]
+    : null;
+
+  const outcome = assessmentOutcome(overallAssessment, foundationAssessment, overall, foundation);
+  if (outcome) {
     return {
       ...base,
       level: NO_CERTIFICATION.id,
       label: NO_CERTIFICATION.label,
       eligible: false,
-      reasons: ['No graded items, so no score could be produced'],
+      outcome: outcome.code,
+      reasons: [outcome.reason],
       blockers,
       thresholds: null,
-      measured: { overall, foundation, coverage },
+      measured: {
+        overall,
+        foundation,
+        coverage,
+        assessment: overallAssessment,
+        foundationAssessment,
+      },
       evaluations: [],
     };
   }
@@ -91,6 +118,7 @@ export function certify(scoreResult, context = {}) {
       { name: 'coverage', required: level.minCoverage, actual: coverage, pass: coverage >= level.minCoverage },
       { name: 'Critical findings', required: 0, actual: criticalFindings.length, pass: criticalFindings.length === 0 },
       { name: 'Zero Tolerance triggers', required: 0, actual: zeroToleranceFindings.length, pass: zeroToleranceFindings.length === 0 },
+      { name: 'excluded share', required: STRUCTURAL_NA_CAP_PCT, actual: scoreResult.structuralNaShare ?? 0, pass: !scoreResult.structuralNaCapExceeded },
     ];
     const pass = conditions.every((c) => c.pass);
     if (pass) achieved = level;
@@ -104,6 +132,7 @@ export function certify(scoreResult, context = {}) {
     level: awarded.id,
     label: awarded.label,
     eligible: Boolean(achieved),
+    outcome: achieved ? 'AWARDED' : blockers.length ? 'BLOCKED' : 'BELOW_REQUIREMENT',
     reasons: buildReasons(evaluations, achieved),
     blockers,
     thresholds: achieved ? levelThresholds(achieved) : levelThresholds(CERTIFICATION_LEVELS[0]),
@@ -121,6 +150,35 @@ export function certify(scoreResult, context = {}) {
       failed: e.conditions.filter((c) => !c.pass).map((c) => c.name),
     })),
   };
+}
+
+/**
+ * Which "cannot be scored yet" state, if any, the audit is in.
+ * Returns null when there is a real score to evaluate.
+ *
+ *   NO_APPLICABLE_ITEMS        nothing in the catalogue applies to this property
+ *   NO_ITEMS_GRADED            it applies, and nothing was assessed
+ *   NO_FOUNDATION_APPLICABLE   no Foundation item applies, so there is no floor
+ *   FOUNDATION_NOT_GRADED      Foundation applies and none of it was assessed
+ */
+function assessmentOutcome(overallAssessment, foundationAssessment, overall, foundation) {
+  if (overallAssessment && overallAssessment.state === 'no_applicable') {
+    return { code: 'NO_APPLICABLE_ITEMS', reason: 'No items in the checklist apply to this property, so no assessment could be made' };
+  }
+  if (overall === null || (overallAssessment && overallAssessment.state === 'none_graded')) {
+    return { code: 'NO_ITEMS_GRADED', reason: 'No items have been assessed yet' };
+  }
+  if (foundationAssessment && foundationAssessment.state === 'no_applicable') {
+    return { code: 'NO_FOUNDATION_APPLICABLE', reason: 'No fundamentals apply to this property, so the Foundation requirement cannot be judged' };
+  }
+  if (foundation === null || (foundationAssessment && foundationAssessment.state === 'none_graded')) {
+    const n = foundationAssessment ? foundationAssessment.itemsApplicable : 0;
+    return {
+      code: 'FOUNDATION_NOT_GRADED',
+      reason: `Items were assessed, but none of the ${n} fundamentals were. Certification cannot be judged without them`,
+    };
+  }
+  return null;
 }
 
 const allowsAuditType = (level, auditType) => level.auditTypes.includes(auditType);
@@ -162,6 +220,8 @@ function describeFailure(condition, level, prefix = '') {
       return `${prefix}${condition.actual} Critical finding${condition.actual === 1 ? '' : 's'} recorded, none permitted`;
     case 'Zero Tolerance triggers':
       return `${prefix}${condition.actual} Zero Tolerance trigger${condition.actual === 1 ? '' : 's'} recorded, none permitted`;
+    case 'excluded share':
+      return `${prefix}${condition.actual}% of the property was excluded as not applicable, against a ${condition.required}% limit`;
     default:
       return `${prefix}${cap(condition.name)} ${condition.actual}% is below the ${condition.required}% required for ${level.label}`;
   }

@@ -174,12 +174,12 @@ test('a missed REC-11 raises a Major finding and does not block on its own', () 
   assert.equal(c.eligible, true, 'Major alone does not block in v1');
 });
 
-test('a partial on a promoted Critical item steps down to Major', () => {
+test('a partial on a promoted Critical item stays Critical', () => {
   const graded = { ...gradeAll(FULL_5, 'met'), 'SAF-01': { day: { status: 'partial' } } };
   const s = score(graded, FULL_5);
-  assert.equal(s.findingCounts.critical, 0);
-  assert.equal(s.findingCounts.major, 1);
-  assert.equal(certify(s, { auditType: AUDIT_TYPE.FULL }).level, 'elite');
+  assert.equal(s.findingCounts.critical, 1);
+  assert.equal(s.findingCounts.major, 0);
+  assert.equal(certify(s, { auditType: AUDIT_TYPE.FULL }).level, 'none');
 });
 
 test('the promoted items are Zero Tolerance eligible and validate as such', () => {

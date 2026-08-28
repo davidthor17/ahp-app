@@ -75,8 +75,9 @@ test('ungraded status creates no finding, so the invalid critical flags do not c
 
   assert.equal(byItem.get('RST-06'), undefined, 'RST-06 is Met, so it raises no finding at all');
 
-  // Neither legacy flag survives as a Critical finding.
-  assert.equal(result.findingCounts.critical, 0);
+  // Neither legacy flag survives. The one Critical finding this audit now
+  // carries comes from FBS-04's own Partial status under the Phase 4B rule,
+  // not from either flag.
   assert.equal(result.findingCounts.zero_tolerance, 0);
   for (const legacy of fixture.legacyCriticalFailures) {
     const finding = byItem.get(legacy.itemId);
@@ -91,7 +92,11 @@ test('ungraded status creates no finding, so the invalid critical flags do not c
 test('certification is decided by actual statuses, not by legacy flags', () => {
   assert.equal(cert.level, 'none');
   assert.equal(cert.eligible, false);
-  assert.deepEqual(cert.blockers, [], 'no Critical or Zero Tolerance blockers exist in this audit');
+  // Phase 4B: FBS-04 was recorded Partial on a Critical item. Under the old
+  // blanket step-down that was a non-blocking Major. It now blocks, which is
+  // the approved conservative model.
+  assert.deepEqual(cert.blockers, ['Critical finding: FBS-04 Allergies and dietary needs taken seriously']);
+  assert.equal(cert.outcome, 'BLOCKED');
   // It fails on the numbers, which is the point: the old system blocked it on
   // two flags attached to items that were never assessed.
   assert.ok(cert.reasons.some((r) => /Overall score 74\.1% is below the 85% required/.test(r)), cert.reasons.join(' | '));
@@ -103,7 +108,7 @@ test('the audit type and tier gates are applied to the real audit', () => {
   assert.equal(cert.auditType, 'full', 'the fixture records tier "full"');
   assert.equal(cert.category, '5★');
   assert.equal(cert.ceiling, 'elite', 'a Full Audit of a 5★ property could have reached Elite');
-  assert.equal(cert.measured.majorFindings, 4, 'Major findings are reported, and do not block in v1');
+  assert.equal(cert.measured.majorFindings, 3, 'one of the four became Critical under Phase 4B');
 });
 
 test('weighted scores, coverage and subscores are stable', () => {
@@ -117,7 +122,9 @@ test('weighted scores, coverage and subscores are stable', () => {
   assert.equal(result.byDimension.service.score, 77.3);
   assert.equal(result.byDimension.product.score, 67.3);
   assert.equal(result.byDimension.experience.score, 56.7);
-  assert.deepEqual(result.findingCounts, { minor: 30, major: 4, critical: 0, zero_tolerance: 0 });
+  // Was { minor: 30, major: 4, critical: 0 } before Phase 4B. The single
+  // reclassification is FBS-04, Partial on a Critical item.
+  assert.deepEqual(result.findingCounts, { minor: 30, major: 3, critical: 1, zero_tolerance: 0 });
 });
 
 test('coverage reflects that a quarter of the property was never assessed', () => {
