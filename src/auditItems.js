@@ -44,6 +44,7 @@ export const SECTIONS = [
     { id: 'REC-08', label: 'Front desk free of clutter', minStars: 4 },
     { id: 'REC-09', label: 'Total check-in time reasonable', minStars: 4 },
     { id: 'REC-10', label: 'Tour offered or facilities map explained', minStars: 4 },
+    { id: 'REC-11', label: 'Reservation delivered exactly as confirmed: room type, rate, dates and stated requirements', minStars: 4 },
   ]},
   { id: 'room', label: 'Room Quality', icon: '□', facility: null, items: [
     { id: 'RM-01', label: 'Surfaces dust-free, mirrors spotless', minStars: 4 },
@@ -64,6 +65,11 @@ export const SECTIONS = [
     { id: 'FAC-04', label: 'Gym equipment modern and well maintained', minStars: 4 },
     { id: 'FAC-05', label: 'Gym access cost clearly disclosed (free or paid)', minStars: 4 },
     { id: 'FAC-06', label: 'Gym has a view or pleasant environment', minStars: 5 },
+  ]},
+  { id: 'safety', label: 'Safety, Security & Integrity', icon: '⊗', facility: null, items: [
+    { id: 'SAF-01', label: 'Emergency exits, fire safety equipment and evacuation information present, unobstructed and current', minStars: 4 },
+    { id: 'SAF-02', label: 'Guest room locks, secondary security and in-room safe function correctly', minStars: 4 },
+    { id: 'SAF-03', label: 'Guests treated with respect and professionalism, without discrimination', minStars: 4 },
   ]},
   { id: 'bathroom', label: 'Bathroom', icon: '◎', facility: null, items: [
     { id: 'BTH-01', label: 'No mold, mildew, or drain odor', minStars: 4 },
@@ -155,6 +161,7 @@ export const SECTIONS = [
     { id: 'SP-10', label: 'Interior lighting appropriate', minStars: 4 },
     { id: 'SP-11', label: 'Massage/treatments offered', minStars: 4 },
     { id: 'SP-12', label: 'Treatment quality (if a treatment was received — describe in notes)', minStars: 4 },
+    { id: 'SP-13', label: 'Guest privacy and dignity protected during treatments and in changing areas', minStars: 4 },
   ]},
   { id: 'housekeeping', label: 'Housekeeping', icon: '⌂', facility: null, items: [
     { id: 'HK-01', label: 'Room cleaned on time', minStars: 4 },

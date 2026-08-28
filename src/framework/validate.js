@@ -1,6 +1,6 @@
 // Structural validation of the framework against the authoritative catalogue.
 //
-// Everything here is derived from auditItems.js and additions.js. No second
+// Everything here is derived from auditItems.js. No second
 // hand-written list of item ids exists anywhere in the framework, so the only
 // way for metadata and checklist to disagree is for one of them to change,
 // and this file fails loudly when they do.

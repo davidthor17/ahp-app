@@ -1,51 +1,20 @@
-// The v1.0 catalogue: the live checklist composed with the staged additions.
+// The v1.0 catalogue.
 //
-// SECTIONS is the authoritative source. Nothing here re-lists item ids by
-// hand, so the framework cannot drift from the console: if an item is added
-// to auditItems.js and not to items.js, validate.js fails.
+// src/auditItems.js is the single authoritative source: the same 147 items the
+// auditor captures are the items the framework scores. Nothing here re-lists an
+// item id by hand, so the two cannot drift. If an item is added to
+// auditItems.js without metadata in items.js, validate.js fails.
 //
-// Phase 1 note: the console renders SECTIONS (142 items). The framework scores
-// against CATALOG_SECTIONS (147). Phase 2 promotes additions.js into
-// auditItems.js, at which point the two become the same list.
+// Until Phase 3B the five Foundation items lived in a staging module and were
+// composed in here, because they had no capture UI. They are now part of the
+// live checklist and that staging module is gone, so this is a plain re-export.
 
 import { SECTIONS } from '../auditItems.js';
-import { NEW_SECTIONS, NEW_ITEMS } from './additions.js';
 import { ITEM_META } from './items.js';
 import { CLASS_WEIGHT, STAR_RANK, DEFAULT_RANK } from './weights.js';
 
-/** The 142 items as the auditor sees them today. */
-export const LIVE_SECTIONS = SECTIONS;
-
-/** The 147-item v1.0 catalogue: live sections plus staged additions. */
-export const CATALOG_SECTIONS = buildCatalog();
-
-function buildCatalog() {
-  const byId = new Map(NEW_ITEMS.reduce((acc, entry) => {
-    const list = acc.find(([id]) => id === entry.sectionId);
-    if (list) list[1].push(entry.item); else acc.push([entry.sectionId, [entry.item]]);
-    return acc;
-  }, []));
-
-  const out = [];
-  for (const section of SECTIONS) {
-    const extra = byId.get(section.id) || [];
-    out.push(extra.length ? { ...section, items: [...section.items, ...extra] } : section);
-    for (const added of NEW_SECTIONS) {
-      if (added.insertAfter === section.id) {
-        const { insertAfter, ...rest } = added;
-        out.push(rest);
-      }
-    }
-  }
-  // Any new section whose anchor does not exist is appended rather than lost.
-  for (const added of NEW_SECTIONS) {
-    if (!out.some((s) => s.id === added.id)) {
-      const { insertAfter, ...rest } = added;
-      out.push(rest);
-    }
-  }
-  return out;
-}
+/** The v1.0 catalogue, identical to the live capture checklist. */
+export const CATALOG_SECTIONS = SECTIONS;
 
 /**
  * Flat list of every catalogue item joined to its framework metadata.

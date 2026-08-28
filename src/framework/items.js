@@ -1,8 +1,8 @@
 // Per-item framework metadata for all 147 catalogue items.
 //
-// Keyed by item id. The catalogue itself lives in auditItems.js (and, until
-// Phase 2, additions.js); this file says only what each item is worth, what it
-// reports into, and how bad it is when it fails.
+// Keyed by item id. The catalogue itself lives in auditItems.js; this file says
+// only what each item is worth, what it reports into, and how bad it is when it
+// fails.
 //
 //   weightClass      foundation x3 / standard x2 / distinction x1
 //   dimension        condition / service / product / experience

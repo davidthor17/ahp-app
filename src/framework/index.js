@@ -8,7 +8,6 @@ export { FRAMEWORK, FRAMEWORK_VERSION, CHECKLIST_VERSION } from './version.js';
 export * from './weights.js';
 export { ITEM_META } from './items.js';
 export {
-  LIVE_SECTIONS,
   CATALOG_SECTIONS,
   catalogItems,
   catalogIndex,

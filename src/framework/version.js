@@ -8,8 +8,7 @@
 export const FRAMEWORK_VERSION = '1.0.0';
 
 // The checklist this framework's metadata is written against. '1.0.0' is the
-// 147-item catalogue: the 142 items live in the console plus the five
-// Foundation items staged in additions.js.
+// 147-item catalogue in auditItems.js, which the console captures in full.
 export const CHECKLIST_VERSION = '1.0.0';
 
 export const FRAMEWORK = Object.freeze({

@@ -463,13 +463,10 @@ export default function AHPAudit() {
   // publishAudit() writes and what the published report reads. Everything
   // below is display only and is never persisted.
   //
-  // Scored against SECTIONS, the 142 items an auditor can actually reach in
-  // this build, not the full 147-item framework catalogue. The five staged
-  // Foundation items have no capture UI yet, so counting them would cap
-  // coverage at 94.7% with no way for an auditor to fix it. Switch this to
-  // CATALOG_SECTIONS in the phase that adds them to the checklist.
-  const FRAMEWORK_SCOPE = SECTIONS;
-
+  // Scored against the whole catalogue. Phase 3B put the five Foundation items
+  // into auditItems.js, so the checklist an auditor captures and the catalogue
+  // the framework scores are now the same 147 items and no scope override is
+  // needed: coverage can reach 100%.
   const frameworkProfile = useMemo(() => ({
     category: prop.category,
     hasRestaurant: prop.hasRestaurant,
@@ -478,7 +475,7 @@ export default function AHPAudit() {
   }), [prop.category, prop.hasRestaurant, prop.hasPool, prop.hasSpa]);
 
   const frameworkResult = useMemo(
-    () => frameworkScore(audit, frameworkProfile, { sections: FRAMEWORK_SCOPE }),
+    () => frameworkScore(audit, frameworkProfile),
     [audit, frameworkProfile],
   );
 
