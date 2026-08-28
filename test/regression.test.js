@@ -96,6 +96,14 @@ test('certification is decided by actual statuses, not by legacy flags', () => {
   // two flags attached to items that were never assessed.
   assert.ok(cert.reasons.some((r) => /Overall score 74\.1% is below the 85% required/.test(r)), cert.reasons.join(' | '));
   assert.ok(cert.reasons.some((r) => /Foundation score 87\.5% is below the 90% required/.test(r)), cert.reasons.join(' | '));
+  assert.ok(cert.reasons.some((r) => /Coverage 71\.2% is below the 80% required/.test(r)), cert.reasons.join(' | '));
+});
+
+test('the audit type and tier gates are applied to the real audit', () => {
+  assert.equal(cert.auditType, 'full', 'the fixture records tier "full"');
+  assert.equal(cert.category, '5★');
+  assert.equal(cert.ceiling, 'elite', 'a Full Audit of a 5★ property could have reached Elite');
+  assert.equal(cert.measured.majorFindings, 4, 'Major findings are reported, and do not block in v1');
 });
 
 test('weighted scores, coverage and subscores are stable', () => {

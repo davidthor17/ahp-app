@@ -28,7 +28,7 @@ import {
   DIMENSIONS,
   SEVERITY,
 } from './weights.js';
-import { applicableItems } from './catalog.js';
+import { applicableItems, rankOf } from './catalog.js';
 import { deriveFinding, worstStatus, InvalidEscalationError } from './findings.js';
 
 const round1 = (n) => Math.round(n * 10) / 10;
@@ -117,6 +117,10 @@ export function score(graded = {}, profile = {}, options = {}) {
   const sectionIds = [...new Set(entries.map((e) => e.sectionId))];
 
   return {
+    // Carried through so certification can apply the property tier rule
+    // without the caller having to pass the profile twice.
+    profile: { category: profile.category || null, rank: rankOf(profile) },
+
     overall,
     overallOfApplicable: inScopeWeight ? round1((numerator / inScopeWeight) * 100) : null,
     coverage: inScopeWeight ? round1((gradedWeight / inScopeWeight) * 100) : 0,

@@ -86,13 +86,58 @@ export const DIMENSIONS = Object.freeze(Object.values(DIMENSION));
 export const STAR_RANK = Object.freeze({ '4★': 4, '5★': 5, 'Ultra': 6 });
 export const DEFAULT_RANK = 4;
 
+// ── Audit types ─────────────────────────────────────────────────────────────
+// Mirrors the tier check constraint on audits.tier. Audit type says how deeply
+// the property was assessed; the certification level says how well it
+// performed. They are separate axes, but the type caps how high the level can
+// reach.
+export const AUDIT_TYPE = Object.freeze({ DESK: 'desk', SPOT: 'spot', FULL: 'full' });
+export const AUDIT_TYPES = Object.freeze(Object.values(AUDIT_TYPE));
+
+// Matches the default on audits.tier, so an audit that never had a type set
+// is treated the way the database already treats it.
+export const DEFAULT_AUDIT_TYPE = AUDIT_TYPE.FULL;
+
+// Property categories that may reach the top level. At 4★ the checklist
+// offers two Distinction items, so an Elite award there would certify
+// flawlessness rather than distinction.
+export const ELITE_CATEGORIES = Object.freeze(['5★', 'Ultra']);
+
 // ── Certification thresholds ────────────────────────────────────────────────
 // Ordered weakest to strongest. Evaluation walks the list and keeps the
 // highest level whose every condition is satisfied.
+//
+// v1 deliberately has no Major finding cap. Critical findings and Zero
+// Tolerance triggers block; Major findings are reported prominently and are
+// left to be calibrated once there is more real audit data.
 export const CERTIFICATION_LEVELS = Object.freeze([
-  Object.freeze({ id: 'certified',   label: 'Specula Certified',   minOverall: 85, minFoundation: 90 }),
-  Object.freeze({ id: 'exceptional', label: 'Specula Exceptional', minOverall: 90, minFoundation: 95 }),
-  Object.freeze({ id: 'elite',       label: 'Specula Elite',       minOverall: 95, minFoundation: 95 }),
+  Object.freeze({
+    id: 'certified',
+    label: 'Specula Certified',
+    minOverall: 85,
+    minFoundation: 90,
+    minCoverage: 80,
+    auditTypes: Object.freeze([AUDIT_TYPE.SPOT, AUDIT_TYPE.FULL]),
+    categories: null, // any
+  }),
+  Object.freeze({
+    id: 'exceptional',
+    label: 'Specula Exceptional',
+    minOverall: 90,
+    minFoundation: 95,
+    minCoverage: 90,
+    auditTypes: Object.freeze([AUDIT_TYPE.FULL]),
+    categories: null,
+  }),
+  Object.freeze({
+    id: 'elite',
+    label: 'Specula Elite',
+    minOverall: 95,
+    minFoundation: 95,
+    minCoverage: 95,
+    auditTypes: Object.freeze([AUDIT_TYPE.FULL]),
+    categories: ELITE_CATEGORIES,
+  }),
 ]);
 
 export const NO_CERTIFICATION = Object.freeze({ id: 'none', label: 'No certification' });
