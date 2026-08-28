@@ -90,16 +90,19 @@ export function score(graded = {}, profile = {}, options = {}) {
     if (!isGraded) continue;
 
     const escalation = firstEscalation(byShift);
+    // What the auditor wrote against the item, so a finding carries its own
+    // evidence. An escalation note, where one exists, takes precedence.
+    const observation = firstNote(byShift);
     try {
       const finding = deriveFinding(item, status, escalation);
-      if (finding) findings.push(finding);
+      if (finding) findings.push(withObservation(finding, observation));
     } catch (err) {
       if (!(err instanceof InvalidEscalationError)) throw err;
       // An invalid escalation is reported, never silently honoured. The
       // derived finding still stands so the audit remains scoreable.
       escalationErrors.push({ itemId: item.id, message: err.message, details: err.details });
       const fallback = deriveFinding(item, status, null);
-      if (fallback) findings.push(fallback);
+      if (fallback) findings.push(withObservation(fallback, observation));
     }
   }
 
@@ -160,6 +163,17 @@ function firstEscalation(byShift) {
   }
   return null;
 }
+
+function firstNote(byShift) {
+  if (!byShift) return null;
+  for (const entry of Object.values(byShift)) {
+    if (entry && typeof entry.note === 'string' && entry.note.trim()) return entry.note.trim();
+  }
+  return null;
+}
+
+const withObservation = (finding, observation) =>
+  (finding.note ? finding : { ...finding, note: observation });
 
 function countBy(findings) {
   const out = { minor: 0, major: 0, critical: 0, zero_tolerance: 0 };

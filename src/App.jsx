@@ -1,6 +1,12 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { SECTIONS } from "./auditItems.js";
+import AuditSummary from "./AuditSummary.jsx";
+// Framework v1 scoring. Imported from the leaf modules rather than index.js so
+// no top-level await reaches the bundle. Runs alongside the legacy score in
+// Phase 2; it does not replace it, and nothing it produces is persisted.
+import { score as frameworkScore } from "./framework/scoring.js";
+import { certify as frameworkCertify } from "./framework/certification.js";
 
 // Settings → API in your Supabase project → Project URL + anon public key.
 // Safe to expose in client code — access is governed by the RLS policies
@@ -444,6 +450,47 @@ export default function AHPAudit() {
     const all = visibleSections.flatMap(s => s.items.filter(i => i.minStars <= rank));
     const done = all.filter(i => shifts.some(sh => ((audit[i.id] || {})[sh.id] || {}).status));
     return { total: all.length, done: done.length };
+  };
+
+  // ── Framework v1 scoring, parallel to the legacy score above ─────────────
+  //
+  // getScorePct() and getCriticalFailures() are untouched and remain what
+  // publishAudit() writes and what the published report reads. Everything
+  // below is display only and is never persisted.
+  //
+  // Scored against SECTIONS, the 142 items an auditor can actually reach in
+  // this build, not the full 147-item framework catalogue. The five staged
+  // Foundation items have no capture UI yet, so counting them would cap
+  // coverage at 94.7% with no way for an auditor to fix it. Switch this to
+  // CATALOG_SECTIONS in the phase that adds them to the checklist.
+  const FRAMEWORK_SCOPE = SECTIONS;
+
+  const frameworkProfile = useMemo(() => ({
+    category: prop.category,
+    hasRestaurant: prop.hasRestaurant,
+    hasPool: prop.hasPool,
+    hasSpa: prop.hasSpa,
+  }), [prop.category, prop.hasRestaurant, prop.hasPool, prop.hasSpa]);
+
+  const frameworkResult = useMemo(
+    () => frameworkScore(audit, frameworkProfile, { sections: FRAMEWORK_SCOPE }),
+    [audit, frameworkProfile],
+  );
+
+  const frameworkCertification = useMemo(
+    () => frameworkCertify(frameworkResult, { auditType: auditTier }),
+    [frameworkResult, auditTier],
+  );
+
+  const sectionLabels = useMemo(
+    () => SECTIONS.reduce((acc, s) => { acc[s.id] = s.label; return acc; }, {}),
+    [],
+  );
+
+  const openSectionFromFinding = (sectionId) => {
+    if (!SECTIONS.some(s => s.id === sectionId)) return;
+    setActiveSection(sectionId);
+    setScreen('section');
   };
 
   const appStyle = { minHeight: '100vh', background: C.bg, color: C.text, fontFamily: '-apple-system, BlinkMacSystemFont, "Inter", sans-serif', fontSize: '15px' };
@@ -891,11 +938,47 @@ export default function AHPAudit() {
             );
           })}
 
+          {/* Read-only, so it is offered to reviewers too. A reviewer is bounced
+              off the finish screen, and this is their route to the summary. */}
+          <button onClick={() => setScreen('summary')} style={{ width: '100%', marginTop: '8px', padding: '13px', borderRadius: '10px', border: `1px solid ${C.border}`, background: 'transparent', color: C.dim, fontSize: '13px', fontWeight: '600', letterSpacing: '0.05em', cursor: 'pointer' }}>
+            SCORING SUMMARY
+          </button>
+
           {!readOnly && (
             <button onClick={() => setScreen('finish')} style={{ width: '100%', marginTop: '8px', padding: '14px', borderRadius: '10px', border: `1px solid ${C.goldBorder}`, background: 'transparent', color: C.gold, fontSize: '13px', fontWeight: '700', letterSpacing: '0.05em', cursor: 'pointer' }}>
               FINISH AUDIT →
             </button>
           )}
+        </div>
+      </div>
+    );
+  }
+
+  // Read-only scoring summary. Same component the finish screen uses, reachable
+  // by reviewers, and it neither writes nor persists anything.
+  if (screen === 'summary') {
+    return (
+      <div style={appStyle}>
+        <div style={headerStyle}>
+          <span style={logoStyle}>A · H · P</span>
+          <button onClick={() => setScreen('home')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Back</button>
+        </div>
+        {readOnly && <ReviewBar />}
+        <div style={bodyStyle}>
+          <div style={{ marginBottom: '24px' }}>
+            <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>SCORING SUMMARY</div>
+            <h1 style={{ fontSize: '19px', fontWeight: '700', margin: 0 }}>{prop.name}</h1>
+            <div style={{ fontSize: '12px', color: C.muted, marginTop: '6px' }}>
+              {prop.category} · {(auditTier === 'desk' ? 'Desk Review' : auditTier === 'spot' ? 'Spot Audit' : 'Full Audit')}
+            </div>
+          </div>
+          <AuditSummary
+            result={frameworkResult}
+            certification={frameworkCertification}
+            palette={C}
+            sectionLabels={sectionLabels}
+            onOpenSection={openSectionFromFinding}
+          />
         </div>
       </div>
     );
@@ -928,12 +1011,29 @@ export default function AHPAudit() {
             {auditTier === 'desk' && <div style={{ fontSize: '11px', color: C.muted, marginTop: '8px' }}>Desk reviews are internal only — no public seal is issued, regardless of score.</div>}
           </div>
 
+          {/* Framework v1. Display only: nothing below is written on publish. */}
+          <AuditSummary
+            result={frameworkResult}
+            certification={frameworkCertification}
+            palette={C}
+            sectionLabels={sectionLabels}
+            onOpenSection={openSectionFromFinding}
+          />
+
+          {/* Legacy scoring. Still the number that publishAudit() writes and the
+              published report renders, so it stays visible and is labelled. */}
           {scorePct !== null && (
-            <div style={{ marginBottom: '20px', padding: '14px 16px', borderRadius: '10px', background: willPass ? 'rgba(77,200,122,0.1)' : C.surface2, border: `1px solid ${willPass ? 'rgba(77,200,122,0.35)' : C.border}` }}>
-              <div style={{ fontSize: '13px', fontWeight: '700', color: willPass ? '#4DC87A' : C.dim }}>
-                {auditTier === 'desk' ? `${scorePct}% — no seal (Desk Review)` : willPass ? `${scorePct}% — meets the standard` : `${scorePct}% — below ${PASS_THRESHOLD}% threshold`}
+            <div style={{ marginBottom: '22px' }}>
+              <span style={lbl}>Currently published scoring</span>
+              <div style={{ padding: '14px 16px', borderRadius: '10px', background: willPass ? 'rgba(77,200,122,0.1)' : C.surface2, border: `1px solid ${willPass ? 'rgba(77,200,122,0.35)' : C.border}` }}>
+                <div style={{ fontSize: '13px', fontWeight: '700', color: willPass ? '#4DC87A' : C.dim }}>
+                  {auditTier === 'desk' ? `${scorePct}% — no seal (Desk Review)` : willPass ? `${scorePct}% — meets the standard` : `${scorePct}% — below ${PASS_THRESHOLD}% threshold`}
+                </div>
+                {failures.length > 0 && auditTier !== 'desk' && <div style={{ fontSize: '12px', color: C.warn, marginTop: '4px' }}>{failures.length} critical failure{failures.length > 1 ? 's' : ''} also blocks the seal, regardless of score.</div>}
+                <div style={{ fontSize: '11px', color: C.muted, marginTop: '8px', lineHeight: '1.5' }}>
+                  This is the figure the public report still uses. The framework result above is not published yet.
+                </div>
               </div>
-              {failures.length > 0 && auditTier !== 'desk' && <div style={{ fontSize: '12px', color: C.warn, marginTop: '4px' }}>{failures.length} critical failure{failures.length > 1 ? 's' : ''} also blocks the seal, regardless of score.</div>}
             </div>
           )}
 

@@ -146,3 +146,28 @@ test('an audit with nothing graded produces no score rather than a zero', () => 
   assert.equal(r.coverage, 0);
   assert.equal(r.findings.length, 0);
 });
+
+test('a finding carries the auditor note written against the item', () => {
+  const graded = {
+    'BTH-01': { day: { status: 'missed', note: '  Visible black mould along the shower seal.  ' } },
+    'ARR-01': { day: { status: 'partial', note: '' } },
+  };
+  const r = score(graded, FULL_5_STAR);
+  const byItem = new Map(r.findings.map((f) => [f.itemId, f]));
+  assert.equal(byItem.get('BTH-01').note, 'Visible black mould along the shower seal.', 'trimmed and carried');
+  assert.equal(byItem.get('ARR-01').note, null, 'an empty note stays null');
+});
+
+test('an escalation note takes precedence over the item note', () => {
+  const graded = {
+    'BTH-01': {
+      day: {
+        status: 'missed',
+        note: 'item note',
+        escalation: { severity: SEVERITY.ZERO_TOLERANCE, note: 'escalation note', evidence: 'p.jpg' },
+      },
+    },
+  };
+  const r = score(graded, FULL_5_STAR);
+  assert.equal(r.findings[0].note, 'escalation note');
+});
