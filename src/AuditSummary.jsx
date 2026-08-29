@@ -168,6 +168,33 @@ export default function AuditSummary({ result, certification, palette: C, onOpen
         )}
       </div>
 
+      {/* ── Assessment completeness ──────────────────────────────────────── */}
+      {certification.foundationAssessment && certification.foundationAssessment.applicable > 0 && (
+        <div style={section}>
+          <span style={label}>Fundamentals assessed</span>
+          <div style={panel}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: '12px' }}>
+              <span style={{ fontSize: '14px', color: C.text }}>
+                {certification.foundationAssessment.graded} of {certification.foundationAssessment.applicable} assessed
+              </span>
+              <span style={{
+                fontSize: '13px', fontFamily: "'IBM Plex Mono', monospace",
+                color: certification.foundationAssessment.unavailable === 0 ? C.gold : C.dim,
+              }}>
+                {certification.foundationAssessment.unavailable === 0
+                  ? 'complete'
+                  : `${certification.foundationAssessment.unavailable} outstanding`}
+              </span>
+            </div>
+            <div style={{ fontSize: '12px', color: C.muted, marginTop: '8px', lineHeight: '1.55' }}>
+              {certification.foundationAssessment.unavailable === 0
+                ? 'Every fundamental that applies to this property was assessed.'
+                : 'Certification asks that the fundamentals are substantially complete. This is about how much of the audit was carried out, not about how the property performed.'}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Quality layers ───────────────────────────────────────────────── */}
       <div style={section}>
         <span style={label}>Quality layers</span>

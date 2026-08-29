@@ -174,6 +174,16 @@ export function score(graded = {}, profile = {}, options = {}) {
       return acc;
     }, {}),
 
+    // ── Foundation assessment completeness ────────────────────────────────
+    //
+    // Counted in items, because every Foundation item weighs the same. An
+    // item is unavailable when it applies under this audit's snapshot but
+    // carries no graded status, whether nobody looked at it, it was recorded
+    // as not observed, or it was excluded as structurally absent. A gate in
+    // the catalogue is different: a sauna that does not exist was never an
+    // applicable item, so it costs nothing.
+    ...foundationAvailability(entries),
+
     findings,
     findingCounts,
     zeroToleranceTriggered: zeroToleranceItems.length > 0,
@@ -226,6 +236,26 @@ function naReasonOf(byShift) {
  *
  * Structural N/A leaves the set, so it neither counts as assessed nor as a gap.
  */
+/**
+ * How complete the assessment of the fundamentals is, in items.
+ *
+ * `foundationApplicable` counts every Foundation item that applies under the
+ * audit's snapshot, including ones later excluded as structurally absent,
+ * because excluding a fundamental is a claim about the audit rather than a
+ * property of the catalogue and should not shrink the yardstick.
+ */
+function foundationAvailability(entries) {
+  const f = entries.filter((e) => e.weightClass === WEIGHT_CLASS.FOUNDATION);
+  const applicable = f.length;
+  const graded = f.filter((e) => e.graded).length;
+  return {
+    foundationApplicable: applicable,
+    foundationGraded: graded,
+    foundationUnavailable: applicable - graded,
+    foundationUnavailableItems: f.filter((e) => !e.graded).map((e) => e.itemId),
+  };
+}
+
 function assessmentOf(entries) {
   const inScope = entries.filter((e) => !e.structural);
   const applicableWeight = inScope.reduce((a, e) => a + e.weight, 0);

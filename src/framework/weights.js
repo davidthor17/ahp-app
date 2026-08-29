@@ -171,4 +171,30 @@ export const CERTIFICATION_LEVELS = Object.freeze([
   }),
 ]);
 
+// ── Foundation assessment completeness ──────────────────────────────────────
+//
+// How many applicable fundamentals may go unassessed at each level. Counted in
+// items, not as a percentage: every Foundation item weighs exactly 3, so the
+// two are equivalent, and a percentage punishes a small property for being
+// small. Three unexamined fundamentals is 8.8% of a 34-item pool and 15% of a
+// 20-item pool; the same three should mean the same thing at both.
+//
+// This is a completeness requirement, not a score penalty. A property is not
+// being marked down, it is being told the audit is not finished.
+export const FOUNDATION_ALLOWANCE = Object.freeze({
+  certified: 3,
+  exceptional: 1,
+  elite: 0,
+});
+
+// ── Spot Audit certification scope ──────────────────────────────────────────
+//
+// A Spot Audit measures coverage against its declared scope, which makes a
+// narrow scope easy to score well on. These sections carry 11 fundamentals
+// between them at every property profile, because none of the three is behind
+// a facility gate, so the core guarantees the right fundamentals rather than
+// merely enough of them.
+export const SPOT_CORE_SECTIONS = Object.freeze(['room', 'bathroom', 'safety']);
+export const SPOT_MIN_ADDITIONAL_SECTIONS = 2;
+
 export const NO_CERTIFICATION = Object.freeze({ id: 'none', label: 'No certification' });

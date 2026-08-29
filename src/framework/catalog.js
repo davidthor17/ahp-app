@@ -33,6 +33,9 @@ export function catalogItems(sections = CATALOG_SECTIONS) {
         sectionId: section.id,
         sectionLabel: section.label,
         facility: section.facility || null,
+        // The sub-feature this one item needs, if any. Carried through here
+        // because isApplicable is handed the joined item, not the raw one.
+        requires: item.requires || null,
         meta,
         weight: meta ? CLASS_WEIGHT[meta.weightClass] : null,
       });
@@ -55,12 +58,25 @@ export function rankOf(profile = {}) {
 
 /**
  * Is this item in scope for this property?
- * Facility must be present, and minStars at or below the property's rank.
- * `scopeSections` narrows the scope further, for a Spot Audit that declares
- * which sections it covers.
+ *
+ * Four gates, in order of how coarse they are:
+ *   facility    the whole section needs a facility, e.g. the spa
+ *   requires    this one item needs a sub-feature, e.g. a sauna inside the spa
+ *   minStars    the item is above the property's category
+ *   scope       a Spot Audit declared which sections it covers
+ *
+ * The `requires` gate exists because a handful of items grade the quality of
+ * something that may simply not be there. Without it, a spa with no sauna had
+ * to record SP-04 as not applicable, which then counted against the Foundation
+ * assessment allowance and could cost the property its certification. An item
+ * that does not apply should never have been an item, not an excused one.
+ *
+ * A missing flag is treated as present. That is deliberate: it keeps every
+ * audit recorded before these flags existed scoring exactly as it did.
  */
 export function isApplicable(item, profile = {}, scopeSections = null) {
   if (item.facility && !profile[item.facility]) return false;
+  if (item.requires && profile[item.requires] === false) return false;
   if (item.minStars > rankOf(profile)) return false;
   if (scopeSections && !scopeSections.includes(item.sectionId)) return false;
   return true;

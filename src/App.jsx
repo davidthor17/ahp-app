@@ -59,6 +59,11 @@ const propToRow = (p, userId) => ({
   room_count: p.roomCount ? Number(p.roomCount) : null, room_types: p.roomTypes,
   has_pool: p.hasPool, pool_capacity: p.poolCapacity ? Number(p.poolCapacity) : null, pool_count: p.poolCount ? Number(p.poolCount) : null,
   has_spa: p.hasSpa,
+  // The sub-feature flags are deliberately NOT written here yet. Their columns
+  // are prepared in migrations/2026-08-29-phase4c-dependency-flags.sql and have
+  // not been applied, and writing a column that does not exist would fail the
+  // whole property upsert. Until the migration lands they live in the audit's
+  // local store and in its frozen snapshot, which is what scoring reads.
   has_restaurant: p.hasRestaurant, fb_capacity: p.fbCapacity ? Number(p.fbCapacity) : null,
   menu_variety: p.menuVariety, menu_complexity: p.menuComplexity,
   authentic_cuisine: p.authenticCuisine, has_wine_list: p.hasWineList,
@@ -77,6 +82,12 @@ const rowToProp = (row) => ({
   hasPool: !!row.has_pool, poolCapacity: row.pool_capacity != null ? String(row.pool_capacity) : '',
   poolCount: row.pool_count != null ? String(row.pool_count) : '1',
   hasSpa: !!row.has_spa,
+  // An absent column means the property was never asked, which reads as present.
+  hasSauna: row.has_sauna == null ? true : !!row.has_sauna,
+  hasChangingRooms: row.has_changing_rooms == null ? true : !!row.has_changing_rooms,
+  hasMinibar: row.has_minibar == null ? true : !!row.has_minibar,
+  hasLunchService: row.has_lunch_service == null ? true : !!row.has_lunch_service,
+  hasGym: row.has_gym == null ? true : !!row.has_gym,
   hasRestaurant: !!row.has_restaurant, fbCapacity: row.fb_capacity != null ? String(row.fb_capacity) : '',
   menuVariety: row.menu_variety || '', menuComplexity: row.menu_complexity || '',
   authenticCuisine: !!row.authentic_cuisine, hasWineList: !!row.has_wine_list,
@@ -103,6 +114,10 @@ export default function AHPAudit() {
     category: '4★', roomCount: '', roomTypes: [],
     hasPool: false, poolCapacity: '', poolCount: '1',
     hasSpa: false,
+    // Sub-features that gate a single item rather than a whole section. They
+    // default to present, so a question nobody has answered yet never quietly
+    // removes an item from the audit.
+    hasSauna: true, hasChangingRooms: true, hasMinibar: true, hasLunchService: true, hasGym: true,
     hasRestaurant: false, fbCapacity: '', menuVariety: '', menuComplexity: '', authenticCuisine: false, hasWineList: false,
     shiftCount: '3', rotationPattern: '2-2-3', shiftTimes: {},
   });
@@ -519,8 +534,13 @@ export default function AHPAudit() {
   );
 
   const frameworkCertification = useMemo(
-    () => frameworkCertify(frameworkResult, { auditType: auditTier }),
-    [frameworkResult, auditTier],
+    () => frameworkCertify(frameworkResult, {
+      auditType: auditTier,
+      // The declared Spot scope travels with the snapshot, so the core rule is
+      // judged against what the audit actually set out to cover.
+      scopeSections: scoringBasis.scopeSections,
+    }),
+    [frameworkResult, auditTier, scoringBasis],
   );
 
   // The snapshot is taken at the first graded item rather than at audit
@@ -792,6 +812,24 @@ export default function AHPAudit() {
                 </div>
               </div>
             ))}
+            {/* Sub-features that decide whether a single item applies. Off means
+                the property does not have it, so the item leaves the audit
+                instead of being excused later. Shown only where relevant. */}
+            {[
+              { key: 'hasGym', label: 'Gym', when: true },
+              { key: 'hasMinibar', label: 'Minibar in rooms', when: true },
+              { key: 'hasLunchService', label: 'Lunch or all-day dining', when: prop.hasRestaurant },
+              { key: 'hasSauna', label: 'Sauna, steam or similar', when: prop.hasSpa },
+              { key: 'hasChangingRooms', label: 'Spa changing rooms', when: prop.hasSpa },
+            ].filter(f => f.when).map((f, i, arr) => (
+              <div key={f.key} onClick={() => updateProp(f.key, !prop[f.key])} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '13px 0', cursor: 'pointer', borderTop: i === 0 ? `1px solid ${C.border}` : 'none', borderBottom: i < arr.length - 1 ? `1px solid ${C.border}` : 'none' }}>
+                <span style={{ fontSize: '14px', color: prop[f.key] ? C.text : C.dim }}>{f.label}</span>
+                <div style={{ width: '42px', height: '24px', borderRadius: '12px', background: prop[f.key] ? C.gold : C.border, position: 'relative', transition: 'background 0.2s', flexShrink: 0 }}>
+                  <div style={{ position: 'absolute', top: '3px', width: '18px', height: '18px', borderRadius: '50%', transition: 'left 0.2s', left: prop[f.key] ? '21px' : '3px', background: prop[f.key] ? '#0C0C0F' : C.muted }} />
+                </div>
+              </div>
+            ))}
+
             {prop.hasPool && (
               <div style={{ paddingTop: '14px', borderTop: `1px solid ${C.border}` }}>
                 <div style={{ display: 'flex', gap: '16px', marginBottom: '10px' }}>

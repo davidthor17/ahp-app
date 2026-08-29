@@ -79,20 +79,31 @@ test('a perfect score with half the audit assessed does NOT certify', () => {
 });
 
 test('coverage gates each level at its own floor', () => {
-  // Everything graded is Met, so overall and Foundation are always 100 and
-  // coverage is the only variable.
-  const cases = [
-    [0.75, 'none'],
-    [0.85, 'certified'],
-    [0.92, 'exceptional'],
-    [1.0, 'elite'],
-  ];
-  for (const [fraction, expected] of cases) {
-    const s = score(gradeFraction(FULL_5_STAR, fraction), FULL_5_STAR);
+  // Everything graded is Met, so overall and Foundation are always 100, and
+  // every fundamental is graded so the assessment allowance never binds.
+  // Coverage is then the only variable, and the level must track its bands.
+  const foundation = itemsWhere(FULL_5_STAR, (m) => m.weightClass === 'foundation');
+  const other = itemsWhere(FULL_5_STAR, (m) => m.weightClass !== 'foundation');
+  const seen = new Set();
+
+  for (let n = 0; n <= other.length; n += 2) {
+    const graded = {};
+    foundation.forEach((id) => { graded[id] = { day: { status: 'met' } }; });
+    other.slice(0, n).forEach((id) => { graded[id] = { day: { status: 'met' } }; });
+
+    const s = score(graded, FULL_5_STAR);
     const r = certify(s, FULL);
-    assert.equal(s.overall, 100);
-    assert.equal(r.level, expected, `coverage ${s.coverage}% should give ${expected}, got ${r.level}`);
+    assert.equal(s.overall, 100, 'quality is held constant');
+    assert.equal(s.foundationUnavailable, 0, 'the allowance is deliberately not the variable here');
+    seen.add(r.level);
+
+    const at = `at coverage ${s.coverage}%`;
+    if (s.coverage >= 95) assert.equal(r.level, 'elite', at);
+    else if (s.coverage >= 90) assert.equal(r.level, 'exceptional', at);
+    else if (s.coverage >= 80) assert.equal(r.level, 'certified', at);
+    else assert.equal(r.level, 'none', at);
   }
+  assert.deepEqual([...seen].sort(), ['certified', 'elite', 'exceptional', 'none']);
 });
 
 test('coverage never reduces the score itself', () => {

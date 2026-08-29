@@ -27,6 +27,10 @@ import {
   SEVERITY,
   WEIGHT_CLASS,
   STRUCTURAL_NA_CAP_PCT,
+  FOUNDATION_ALLOWANCE,
+  SPOT_CORE_SECTIONS,
+  SPOT_MIN_ADDITIONAL_SECTIONS,
+  AUDIT_TYPE,
 } from './weights.js';
 
 /**
@@ -35,6 +39,7 @@ import {
  */
 export function certify(scoreResult, context = {}) {
   const auditType = context.auditType || DEFAULT_AUDIT_TYPE;
+  const scopeSections = context.scopeSections || null;
   const category = context.category
     || (scoreResult.profile && scoreResult.profile.category)
     || null;
@@ -108,6 +113,9 @@ export function certify(scoreResult, context = {}) {
     };
   }
 
+  const foundationUnavailable = scoreResult.foundationUnavailable ?? 0;
+  const spotScope = spotScopeEligibility(auditType, scopeSections);
+
   let achieved = null;
   const evaluations = CERTIFICATION_LEVELS.map((level) => {
     const conditions = [
@@ -119,6 +127,8 @@ export function certify(scoreResult, context = {}) {
       { name: 'Critical findings', required: 0, actual: criticalFindings.length, pass: criticalFindings.length === 0 },
       { name: 'Zero Tolerance triggers', required: 0, actual: zeroToleranceFindings.length, pass: zeroToleranceFindings.length === 0 },
       { name: 'excluded share', required: STRUCTURAL_NA_CAP_PCT, actual: scoreResult.structuralNaShare ?? 0, pass: !scoreResult.structuralNaCapExceeded },
+      { name: 'fundamentals assessed', required: FOUNDATION_ALLOWANCE[level.id], actual: foundationUnavailable, pass: foundationUnavailable <= FOUNDATION_ALLOWANCE[level.id] },
+      { name: 'spot scope', required: null, actual: spotScope, pass: spotScope.eligible },
     ];
     const pass = conditions.every((c) => c.pass);
     if (pass) achieved = level;
@@ -136,10 +146,20 @@ export function certify(scoreResult, context = {}) {
     reasons: buildReasons(evaluations, achieved),
     blockers,
     thresholds: achieved ? levelThresholds(achieved) : levelThresholds(CERTIFICATION_LEVELS[0]),
+    foundationAssessment: {
+      applicable: scoreResult.foundationApplicable ?? null,
+      graded: scoreResult.foundationGraded ?? null,
+      unavailable: foundationUnavailable,
+      unavailableItems: scoreResult.foundationUnavailableItems || [],
+      eligibleFor: CERTIFICATION_LEVELS.filter((l) => foundationUnavailable <= FOUNDATION_ALLOWANCE[l.id]).map((l) => l.id),
+    },
+    foundationAssessmentEligible: foundationUnavailable <= FOUNDATION_ALLOWANCE.certified,
+    spotScope,
     measured: {
       overall,
       foundation,
       coverage,
+      foundationUnavailable,
       criticalFindings: criticalFindings.length,
       majorFindings: majorFindings.length,
       zeroToleranceTriggers: zeroToleranceFindings.length,
@@ -180,6 +200,42 @@ function assessmentOutcome(overallAssessment, foundationAssessment, overall, fou
   }
   return null;
 }
+
+/**
+ * Is a Spot Audit's declared scope wide enough to certify against?
+ *
+ * A Spot Audit measures coverage against its own scope, which makes a narrow
+ * scope trivially easy to score well on. A scope of Pre-Arrival, Reception and
+ * Departure touches two of the thirty four fundamentals and used to reach
+ * Certified on that basis.
+ *
+ * The core carries eleven fundamentals at every property profile, because none
+ * of the three sections is behind a facility gate. Anything outside a Spot
+ * Audit is unaffected: a Full Audit covers the whole catalogue by definition.
+ */
+export function spotScopeEligibility(auditType, scopeSections) {
+  if (auditType !== AUDIT_TYPE.SPOT) return { applies: false, eligible: true, missingCore: [], additional: null };
+  // A Spot Audit that declared no scope is scored against the whole property,
+  // so it necessarily contains the core.
+  if (!Array.isArray(scopeSections) || scopeSections.length === 0) {
+    return { applies: true, eligible: true, missingCore: [], additional: null, undeclared: true };
+  }
+  const missingCore = SPOT_CORE_SECTIONS.filter((s) => !scopeSections.includes(s));
+  const additional = scopeSections.filter((s) => !SPOT_CORE_SECTIONS.includes(s)).length;
+  return {
+    applies: true,
+    eligible: missingCore.length === 0 && additional >= SPOT_MIN_ADDITIONAL_SECTIONS,
+    missingCore,
+    additional,
+    requiredAdditional: SPOT_MIN_ADDITIONAL_SECTIONS,
+  };
+}
+
+const SECTION_NAMES = {
+  room: 'Room Quality',
+  bathroom: 'Bathroom',
+  safety: 'Safety, Security & Integrity',
+};
 
 const allowsAuditType = (level, auditType) => level.auditTypes.includes(auditType);
 const allowsCategory = (level, category) => !level.categories || level.categories.includes(category);
@@ -222,6 +278,19 @@ function describeFailure(condition, level, prefix = '') {
       return `${prefix}${condition.actual} Zero Tolerance trigger${condition.actual === 1 ? '' : 's'} recorded, none permitted`;
     case 'excluded share':
       return `${prefix}${condition.actual}% of the property was excluded as not applicable, against a ${condition.required}% limit`;
+    case 'fundamentals assessed':
+      // Deliberately worded as incompleteness, not as a score penalty. The
+      // property is not being marked down, the audit is not finished.
+      return condition.required === 0
+        ? `${prefix}${condition.actual} of the fundamentals ${condition.actual === 1 ? 'was' : 'were'} not assessed, and this level requires all of them`
+        : `${prefix}${condition.actual} of the fundamentals were not assessed, and this level allows at most ${condition.required}`;
+    case 'spot scope': {
+      const s = condition.actual;
+      if (s.missingCore && s.missingCore.length) {
+        return `${prefix}a Spot Audit must include ${s.missingCore.map((x) => SECTION_NAMES[x] || x).join(' and ')} to be eligible`;
+      }
+      return `${prefix}a Spot Audit must cover at least ${s.requiredAdditional} areas beyond the required three, this one covers ${s.additional}`;
+    }
     default:
       return `${prefix}${cap(condition.name)} ${condition.actual}% is below the ${condition.required}% required for ${level.label}`;
   }
