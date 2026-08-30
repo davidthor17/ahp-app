@@ -13,6 +13,8 @@ import {
   SNAPSHOT_STATUS,
 } from "./framework/snapshot.js";
 import { catalogIndex, isApplicable } from "./framework/catalog.js";
+import { buildPublishedResult, validatePublishedResult } from "./framework/publishedResult.js";
+import { dependencyFlagsToRow, dependencyFlagsFromRow } from "./framework/propertyFlags.js";
 import { itemChangeIsMaterial, trailEntry } from "./framework/trail.js";
 
 // Settings → API in your Supabase project → Project URL + anon public key.
@@ -74,7 +76,20 @@ const propToRow = (p, userId) => ({
   authentic_cuisine: p.authenticCuisine, has_wine_list: p.hasWineList,
   shift_count: p.shiftCount, rotation_pattern: p.rotationPattern, shift_times: p.shiftTimes,
   created_by: userId,
+  ...dependencyFlagsToRow(p),
 });
+
+// The five sub-feature flags, and only the ones somebody has answered.
+//
+// These carry three states, not two: true, false, and null for a question
+// nobody has been asked. Null is the truth for every property that predates the
+// flags, and it must stay the truth: a wrong true only adds requirements an
+// auditor will notice, while a wrong false silently removes them and nobody
+// notices. So a key is omitted entirely when the value is unknown. An omitted
+// key leaves the column exactly as it was, which means saving a property to
+// change its name cannot invent a sauna along the way.
+// The three-state semantics live in framework/propertyFlags.js so they can be
+// tested; Node cannot import a .jsx file.
 
 // properties row (snake_case) -> prop (camelCase UI state). Reverse of propToRow.
 // Used only when a reviewer opens an audit for reading; the capture flow never
@@ -87,12 +102,11 @@ const rowToProp = (row) => ({
   hasPool: !!row.has_pool, poolCapacity: row.pool_capacity != null ? String(row.pool_capacity) : '',
   poolCount: row.pool_count != null ? String(row.pool_count) : '1',
   hasSpa: !!row.has_spa,
-  // An absent column means the property was never asked, which reads as present.
-  hasSauna: row.has_sauna == null ? true : !!row.has_sauna,
-  hasChangingRooms: row.has_changing_rooms == null ? true : !!row.has_changing_rooms,
-  hasMinibar: row.has_minibar == null ? true : !!row.has_minibar,
-  hasLunchService: row.has_lunch_service == null ? true : !!row.has_lunch_service,
-  hasGym: row.has_gym == null ? true : !!row.has_gym,
+  // Null stays null. It means nobody has been asked, and collapsing it to true
+  // here would have written that fabricated answer straight back on the next
+  // save. Scoring is unaffected either way: isApplicable gates only on an
+  // explicit false, so an unknown flag keeps every item it always kept.
+  ...dependencyFlagsFromRow(row),
   hasRestaurant: !!row.has_restaurant, fbCapacity: row.fb_capacity != null ? String(row.fb_capacity) : '',
   menuVariety: row.menu_variety || '', menuComplexity: row.menu_complexity || '',
   authenticCuisine: !!row.authentic_cuisine, hasWineList: !!row.has_wine_list,
@@ -171,6 +185,9 @@ export default function AHPAudit() {
   const [summaryDraft, setSummaryDraft]   = useState('');
   const [auditTier, setAuditTier]         = useState('full'); // desk | spot | full
   const [publishState, setPublishState]   = useState('idle'); // idle | saving | done | error
+  // Why a publish failed, so the message can say something useful. A missing
+  // column is not a connection problem and retrying will not help.
+  const [publishReason, setPublishReason] = useState(null);
 
   // ---------- reviewer (read-only external access) ----------
   // profile is the caller's own auditors row. The database is the security
@@ -508,22 +525,58 @@ export default function AHPAudit() {
     return graded ? Math.round((met / graded) * 100) : null;
   };
 
+  // Publishing writes the report, not just a status.
+  //
+  // The public page used to be a live query: it read the property row as it
+  // stands now and recomputed the score from item rows that stay writable after
+  // publication. A report was a view of the present rather than a record of what
+  // was issued. The payload built here is that record, and once it is written
+  // the public page renders it and consults nothing else.
   const publishAudit = async (summary, tier) => {
     if (!ids.auditId || readOnly) return { ok: false, reason: 'no-audit' };
     const failures = getCriticalFailures();
     try {
+      // The date of the stay lives on the audit row, not in local state. Read
+      // it before building so the payload can carry it rather than guessing.
+      const { data: row, error: readErr } = await supabase
+        .from('audits').select('date').eq('id', ids.auditId).single();
+      if (readErr) throw readErr;
+
+      // One timestamp for this publication, used everywhere in the payload.
+      const publishedAt = new Date().toISOString();
+      const payload = buildPublishedResult({
+        prop, graded: audit, auditType: tier, criticalFailures: failures,
+        scoringBasis, auditedOn: row ? row.date : null, publishedAt, summary,
+      });
+
+      // A payload that would not render must never reach the database. Failing
+      // here leaves the audit unpublished, which is recoverable; publishing an
+      // unrenderable payload is not.
+      const problems = validatePublishedResult(payload);
+      if (problems.length) {
+        setSyncState('error');
+        return { ok: false, reason: 'invalid-payload', details: problems };
+      }
+
       const { error } = await supabase.from('audits').update({
         status: 'published',
         auditor_summary: summary,
         critical_failures: failures,
         tier,
+        published_result: payload,
       }).eq('id', ids.auditId);
       if (error) throw error;
       setSyncState('synced');
       return { ok: true };
     } catch (e) {
       setSyncState('error');
-      return { ok: false, reason: 'error' };
+      // The column is added by migrations/2026-08-30-phase55-published-result.sql,
+      // which is not applied. Until it is, this is the error publishing returns,
+      // and it is reported rather than swallowed: publishing without the payload
+      // would quietly produce exactly the live-query report this phase removes.
+      const missingColumn = e && (e.code === '42703' || e.code === 'PGRST204'
+        || /published_result/.test(e.message || ''));
+      return { ok: false, reason: missingColumn ? 'schema-missing' : 'error' };
     }
   };
 
@@ -890,9 +943,13 @@ export default function AHPAudit() {
                 </div>
               </div>
             ))}
-            {/* Sub-features that decide whether a single item applies. Off means
-                the property does not have it, so the item leaves the audit
-                instead of being excused later. Shown only where relevant. */}
+            {/* Sub-features that decide whether a single item applies.
+                Three states, not two. "Not present" removes the item from the
+                audit; "Unknown" means nobody has been asked and keeps every
+                item, which is what a property recorded before these questions
+                existed must stay on until somebody answers. A toggle would have
+                forced every unknown into a yes or a no the first time the
+                property was saved. Shown only where relevant. */}
             {[
               { key: 'hasGym', label: 'Gym', when: true },
               { key: 'hasMinibar', label: 'Minibar in rooms', when: true },
@@ -900,10 +957,30 @@ export default function AHPAudit() {
               { key: 'hasSauna', label: 'Sauna, steam or similar', when: prop.hasSpa },
               { key: 'hasChangingRooms', label: 'Spa changing rooms', when: prop.hasSpa },
             ].filter(f => f.when).map((f, i, arr) => (
-              <div key={f.key} onClick={() => updateProp(f.key, !prop[f.key])} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '13px 0', cursor: 'pointer', borderTop: i === 0 ? `1px solid ${C.border}` : 'none', borderBottom: i < arr.length - 1 ? `1px solid ${C.border}` : 'none' }}>
-                <span style={{ fontSize: '14px', color: prop[f.key] ? C.text : C.dim }}>{f.label}</span>
-                <div style={{ width: '42px', height: '24px', borderRadius: '12px', background: prop[f.key] ? C.gold : C.border, position: 'relative', transition: 'background 0.2s', flexShrink: 0 }}>
-                  <div style={{ position: 'absolute', top: '3px', width: '18px', height: '18px', borderRadius: '50%', transition: 'left 0.2s', left: prop[f.key] ? '21px' : '3px', background: prop[f.key] ? '#0C0C0F' : C.muted }} />
+              <div key={f.key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', padding: '11px 0', borderTop: i === 0 ? `1px solid ${C.border}` : 'none', borderBottom: i < arr.length - 1 ? `1px solid ${C.border}` : 'none' }}>
+                <span style={{ fontSize: '14px', color: prop[f.key] === false ? C.dim : C.text }}>{f.label}</span>
+                <div style={{ display: 'flex', flexShrink: 0, borderRadius: '7px', overflow: 'hidden', border: `1px solid ${C.border}` }}>
+                  {[
+                    { value: true, label: 'Yes' },
+                    { value: false, label: 'No' },
+                    { value: null, label: 'Unknown' },
+                  ].map(opt => {
+                    const active = prop[f.key] === opt.value;
+                    return (
+                      <button
+                        key={String(opt.value)}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => updateProp(f.key, opt.value)}
+                        style={{
+                          padding: '6px 10px', fontSize: '11px', fontWeight: '600', cursor: 'pointer',
+                          border: 'none', borderLeft: opt.value === true ? 'none' : `1px solid ${C.border}`,
+                          background: active ? (opt.value === null ? C.surface2 : C.gold) : 'transparent',
+                          color: active ? (opt.value === null ? C.dim : '#0C0C0F') : C.muted,
+                        }}
+                      >{opt.label}</button>
+                    );
+                  })}
                 </div>
               </div>
             ))}
@@ -1290,11 +1367,22 @@ export default function AHPAudit() {
           <button disabled={!session || publishState === 'saving'} onClick={async () => {
             setPublishState('saving');
             const res = await publishAudit(summaryDraft, auditTier);
+            setPublishReason(res.ok ? null : (res.reason || 'error'));
             setPublishState(res.ok ? 'done' : 'error');
           }} style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: session ? C.gold : C.surface2, color: session ? '#0C0C0F' : C.muted, fontSize: '14px', fontWeight: '700', letterSpacing: '0.06em', cursor: session ? 'pointer' : 'default' }}>
             {publishState === 'saving' ? 'PUBLISHING…' : publishState === 'done' ? 'PUBLISHED ✓' : 'PUBLISH AUDIT'}
           </button>
-          {publishState === 'error' && <div style={{ marginTop: '10px', fontSize: '12px', color: '#E05555' }}>Couldn't publish — check your connection and try again.</div>}
+          {/* A failed publish says which kind of failure it was. The schema case
+              is not a connection problem and retrying will not fix it. */}
+          {publishState === 'error' && (
+            <div style={{ marginTop: '10px', fontSize: '12px', color: '#E05555', lineHeight: '1.5' }}>
+              {publishReason === 'schema-missing'
+                ? 'This audit was not published. The database cannot yet store a published report, so publishing would produce a report that changes whenever the property record changes. Nothing was written.'
+                : publishReason === 'invalid-payload'
+                  ? 'This audit was not published. The report could not be assembled from what has been recorded. Nothing was written.'
+                  : "Couldn't publish. Check your connection and try again."}
+            </div>
+          )}
           {publishState === 'done' && (
             <div style={{ marginTop: '14px' }}>
               <div style={{ fontSize: '12px', color: '#4DC87A', marginBottom: '8px' }}>This audit is now live for {prop.name}.</div>

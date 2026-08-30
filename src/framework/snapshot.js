@@ -175,7 +175,13 @@ export function resolveScoringProfile(snapshot, liveProp = {}, status = null) {
 
   const profile = { category: liveProp.category || null };
   for (const flag of SECTION_FACILITY_FLAGS) profile[flag] = Boolean(liveProp[flag]);
-  for (const flag of DEPENDENCY_FLAGS) profile[flag] = liveProp[flag] === undefined ? true : Boolean(liveProp[flag]);
+  // Present unless the property explicitly says otherwise, exactly as
+  // buildSnapshot and isApplicable read it. This was `Boolean(liveProp[flag])`
+  // with only undefined special-cased, which was harmless while the console
+  // could not hold a null, and became a real fault the moment it could: a
+  // property whose questions nobody had answered lost five items the instant it
+  // was read, before any snapshot existed to protect them.
+  for (const flag of DEPENDENCY_FLAGS) profile[flag] = liveProp[flag] !== false;
   return {
     profile,
     auditType: DEFAULT_AUDIT_TYPE,
