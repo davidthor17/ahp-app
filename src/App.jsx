@@ -9,6 +9,7 @@ import { score as frameworkScore } from "./framework/scoring.js";
 import { certify as frameworkCertify } from "./framework/certification.js";
 import { NA_REASON } from "./framework/weights.js";
 import { buildSnapshot, resolveScoringProfile } from "./framework/snapshot.js";
+import { catalogIndex, isApplicable } from "./framework/catalog.js";
 import { itemChangeIsMaterial, trailEntry } from "./framework/trail.js";
 
 // Settings → API in your Supabase project → Project URL + anon public key.
@@ -23,7 +24,8 @@ const SHIFT_SYSTEMS = {
   '3': { label: '3 shifts', shifts: [{ id: 'morning', label: 'Morning', time: '07:00–15:00' }, { id: 'afternoon', label: 'Afternoon', time: '15:00–23:00' }, { id: 'night', label: 'Night', time: '23:00–07:00' }] },
 };
 const ROTATION_LABELS = ['2-2-3', '5-5-4', '4-4-5', 'Fixed'];
-const STAR_RANK = { '4★': 4, '5★': 5, 'Ultra': 6 };
+// The star ranking itself now lives in the framework, which is the only thing
+// that decides whether an item applies. STAR_LABELS is still the picker's list.
 const STAR_LABELS = ['4★', '5★', 'Ultra'];
 const ROOM_TYPES = ['Standard', 'Deluxe', 'Suite', 'Villa'];
 const MENU_VARIETY = ['Limited', 'Balanced', 'Extensive'];
@@ -487,8 +489,34 @@ export default function AHPAudit() {
     }
   };
 
-  const rank = STAR_RANK[prop.category] || 4;
-  const visibleSections = SECTIONS.filter(s => !s.facility || prop[s.facility]);
+  // ── The one property basis this audit uses ───────────────────────────────
+  //
+  // Before the first graded item there is no snapshot and this resolves to the
+  // live property, so setup stays editable. After it, this is the frozen
+  // snapshot and the capture screen follows it exactly as the scoring engine
+  // does. They were separate before: scoring read the snapshot while the
+  // checklist read the live property, so editing the property mid-audit could
+  // hide items that still counted against the audit.
+  const scoringBasis = useMemo(
+    () => resolveScoringProfile(snapshot, prop),
+    [snapshot, prop],
+  );
+  const captureProfile = scoringBasis.profile;
+
+  // The framework's own applicability, asked with the framework's own profile,
+  // so capture and scoring cannot disagree. catalogIndex carries the joined
+  // item, which is what isApplicable expects; the raw SECTIONS item does not
+  // know its own section.
+  const itemIndex = useMemo(() => catalogIndex(), []);
+  const isItemApplicable = useCallback(
+    (itemId) => {
+      const item = itemIndex.get(itemId);
+      return item ? isApplicable(item, captureProfile, scoringBasis.scopeSections) : false;
+    },
+    [itemIndex, captureProfile, scoringBasis.scopeSections],
+  );
+
+  const visibleSections = SECTIONS.filter(s => !s.facility || captureProfile[s.facility]);
   const getActiveData = (itemId) => (audit[itemId] || {})[activeShiftId] || {};
   const getShiftData  = (itemId, shiftId) => (audit[itemId] || {})[shiftId] || {};
 
@@ -498,7 +526,7 @@ export default function AHPAudit() {
   };
 
   const getSectionStats = (section) => {
-    const applicable = section.items.filter(i => i.minStars <= rank);
+    const applicable = section.items.filter(i => isItemApplicable(i.id));
     const done = applicable.filter(i => shifts.some(s => (audit[i.id] || {})[s.id] && (audit[i.id] || {})[s.id].status));
     const missed = applicable.filter(i => shifts.some(s => ((audit[i.id] || {})[s.id] || {}).status === 'missed')).length;
     const inconsistent = applicable.filter(i => isInconsistent(i.id)).length;
@@ -506,7 +534,7 @@ export default function AHPAudit() {
   };
 
   const getOverallProgress = () => {
-    const all = visibleSections.flatMap(s => s.items.filter(i => i.minStars <= rank));
+    const all = visibleSections.flatMap(s => s.items.filter(i => isItemApplicable(i.id)));
     const done = all.filter(i => shifts.some(sh => ((audit[i.id] || {})[sh.id] || {}).status));
     return { total: all.length, done: done.length };
   };
@@ -522,12 +550,9 @@ export default function AHPAudit() {
   // the framework scores are the same 147 items and coverage can reach 100%.
   //
   // Phase 4B: scoring reads the snapshot, not the live property. Once grading
-  // starts, editing the property record can no longer move this audit.
-  const scoringBasis = useMemo(
-    () => resolveScoringProfile(snapshot, prop),
-    [snapshot, prop],
-  );
-
+  // starts, editing the property record can no longer move this audit. The
+  // basis is resolved once, above, and shared with the capture screen so the
+  // two can never disagree about which items belong to this audit.
   const frameworkResult = useMemo(
     () => frameworkScore(audit, scoringBasis.profile, { scopeSections: scoringBasis.scopeSections }),
     [audit, scoringBasis],
@@ -1255,7 +1280,7 @@ export default function AHPAudit() {
           )}
 
           {section.items.map(item => {
-            const applicable = item.minStars <= rank;
+            const applicable = isItemApplicable(item.id);
             const activeData = getActiveData(item.id);
             const cfg = activeData.status ? STATUS[activeData.status] : null;
             const noteVisible = openNotes[item.id] || activeData.note;

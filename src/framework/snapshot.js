@@ -39,10 +39,15 @@ export const FACILITY_FLAGS = Object.freeze([...SECTION_FACILITY_FLAGS, ...DEPEN
  */
 export function buildSnapshot(prop = {}, context = {}) {
   const facilityProfile = {};
+  // A section gate is absent unless the property says otherwise, which matches
+  // isApplicable's `!profile[item.facility]` and the not-null defaults on the
+  // three has_* columns.
   for (const flag of SECTION_FACILITY_FLAGS) facilityProfile[flag] = Boolean(prop[flag]);
-  // A dependency flag the property has never been asked about defaults to
-  // present, so a new gate can never remove an item from an audit by surprise.
-  for (const flag of DEPENDENCY_FLAGS) facilityProfile[flag] = prop[flag] === undefined ? true : Boolean(prop[flag]);
+  // A dependency gate is present unless the property explicitly says it is not.
+  // This has to mirror isApplicable's `profile[item.requires] === false` exactly:
+  // Boolean() would turn null, which means nobody has been asked, into false,
+  // and quietly drop five fundamentals out of the audit at snapshot time.
+  for (const flag of DEPENDENCY_FLAGS) facilityProfile[flag] = prop[flag] !== false;
 
   return {
     propertyCategory: prop.category || null,

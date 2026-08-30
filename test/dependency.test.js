@@ -422,3 +422,92 @@ test('a flag has three states and only false gates the item out', () => {
     assert.equal(has({ ...base, [flag]: false }, id), false, `${id}: only false removes it`);
   }
 });
+
+// ── Phase 5.2: an unknown flag survives being snapshotted ──────────────────
+//
+// buildSnapshot used Boolean() on every flag, so null and undefined were
+// frozen as false. isApplicable gates on an explicit false, so the moment an
+// audit locked, five fundamentals nobody had ever been asked about dropped out
+// of it. The live property read them as present; its own snapshot did not.
+
+test('a null flag is stamped into a snapshot as present, not as null', () => {
+  const prop = { category: '5★', hasRestaurant: true, hasPool: true, hasSpa: true, hasSauna: null };
+  const snap = buildSnapshot(prop, FULL);
+  assert.equal(snap.facilityProfile.hasSauna, true, 'unknown is not absent');
+  assert.equal(typeof snap.facilityProfile.hasSauna, 'boolean', 'and it is stored as a boolean');
+});
+
+test('an unknown flag is not a recorded absence, in any of its forms', () => {
+  const base = { category: '5★', hasRestaurant: true, hasPool: true, hasSpa: true };
+  for (const state of [undefined, null]) {
+    const snap = buildSnapshot({ ...base, hasGym: state }, FULL);
+    assert.equal(snap.facilityProfile.hasGym, true, `${String(state)} must freeze as present`);
+  }
+  assert.equal(buildSnapshot(base, FULL).facilityProfile.hasGym, true, 'absent must freeze as present');
+  assert.equal(buildSnapshot({ ...base, hasGym: false }, FULL).facilityProfile.hasGym, false,
+    'a recorded absence is the only thing that freezes as absent');
+});
+
+test('a section flag still freezes on presence, not on absence', () => {
+  // The three section flags are not-null in the schema and have always been
+  // answered, so absent genuinely means no. Only the dependency flags carry
+  // the three-state meaning.
+  const snap = buildSnapshot({ category: '5★', hasRestaurant: true }, FULL);
+  assert.equal(snap.facilityProfile.hasRestaurant, true);
+  assert.equal(snap.facilityProfile.hasPool, false);
+  assert.equal(snap.facilityProfile.hasSpa, false);
+});
+
+test('a property and its own snapshot agree on every item, in every flag state', () => {
+  const base = { category: '5★', hasRestaurant: true, hasPool: true, hasSpa: true };
+  const idsOf = (profile) => applicableItems(profile).map((i) => i.id);
+  const foundationCount = (profile) => foundationIds(profile).length;
+
+  for (const flag of DEPENDENCY_FLAGS) {
+    for (const state of ['absent', null, undefined, true, false]) {
+      const prop = state === 'absent' ? { ...base } : { ...base, [flag]: state };
+      const viaSnapshot = resolveScoringProfile(buildSnapshot(prop, FULL), prop).profile;
+
+      assert.deepEqual(
+        idsOf(viaSnapshot), idsOf(prop),
+        `${flag}=${String(state)}: the snapshot must select what the property selects`,
+      );
+      assert.equal(
+        foundationCount(viaSnapshot), foundationCount(prop),
+        `${flag}=${String(state)}: the Foundation denominator must not move`,
+      );
+    }
+  }
+});
+
+test('a recorded false still removes its dependent item through the snapshot', () => {
+  const cases = [
+    ['hasSauna', ['SP-04']],
+    ['hasChangingRooms', ['SP-02', 'SP-03']],
+    ['hasMinibar', ['RM-10']],
+    ['hasLunchService', ['LUN-02']],
+    ['hasGym', ['FAC-04', 'FAC-05', 'FAC-06']],
+  ];
+  for (const [flag, gatedIds] of cases) {
+    const prop = { ...FULL_5, [flag]: false };
+    const viaSnapshot = resolveScoringProfile(buildSnapshot(prop, FULL), prop).profile;
+    const ids = new Set(applicableItems(viaSnapshot).map((i) => i.id));
+    for (const id of gatedIds) {
+      assert.equal(ids.has(id), false, `${flag}=false must remove ${id} through the snapshot too`);
+    }
+  }
+});
+
+test('an all-unknown property keeps its full audit once locked', () => {
+  // The state of all seven production properties today: nobody has been asked
+  // about any of the five. Locking an audit must not shrink it.
+  const unknown = { category: '5★', hasRestaurant: true, hasPool: true, hasSpa: true };
+  const live = applicableItems(unknown);
+  const frozen = applicableItems(resolveScoringProfile(buildSnapshot(unknown, FULL), unknown).profile);
+  assert.equal(frozen.length, live.length);
+  assert.equal(frozen.length, 133, '5★ with every facility carries 133 of the 147 items');
+  assert.equal(
+    frozen.filter((i) => i.meta.weightClass === 'foundation').length, 34,
+    'and all 34 fundamentals',
+  );
+});
