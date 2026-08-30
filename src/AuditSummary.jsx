@@ -35,7 +35,41 @@ const AUDIT_TYPE_COPY = { desk: 'Desk Review', spot: 'Spot Audit', full: 'Full A
 const NOT_SCORED = 'Not scored';
 const pct = (v) => (v === null || v === undefined ? NOT_SCORED : `${v}%`);
 
-export default function AuditSummary({ result, certification, palette: C, onOpenFinding }) {
+const basisDate = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? null
+    : d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+/**
+ * One line saying what this score was measured against.
+ *
+ * An audit that froze its basis when grading began can be reproduced exactly.
+ * One carried out before that existed cannot, and says so plainly rather than
+ * borrowing today's property record and presenting it as the record. Neither
+ * is an error, so both read in the same quiet grey as the line above them.
+ */
+export function basisNote(basis) {
+  if (!basis) return null;
+  switch (basis.status) {
+    case 'frozen': {
+      const on = basisDate(basis.lockedAt);
+      return on ? `Scoring basis frozen ${on}.` : 'Scored against this audit’s frozen basis.';
+    }
+    case 'legacy-unfrozen':
+      return 'Legacy audit — the scoring basis was not recorded at the time of the audit. '
+        + 'Scored against the property as it stands today, so this result cannot be reproduced as history.';
+    case 'unusable':
+      return 'The recorded scoring basis could not be read, and has been left exactly as found. '
+        + 'Scored against the property as it stands today.';
+    default:
+      return null;
+  }
+}
+
+export default function AuditSummary({ result, certification, basis, palette: C, onOpenFinding }) {
   const [showMinor, setShowMinor] = useState(false);
 
   const achieved = certification.eligible;
@@ -53,6 +87,7 @@ export default function AuditSummary({ result, certification, palette: C, onOpen
   const minor = all.filter((f) => f.severity === 'minor');
 
   const scoreAccent = zeroTolerance ? C.warn : achieved ? C.gold : C.text;
+  const note = basisNote(basis);
 
   const section = { marginBottom: '26px' };
   const label = {
@@ -137,6 +172,13 @@ export default function AuditSummary({ result, certification, palette: C, onOpen
                 Highest level available to a {AUDIT_TYPE_COPY[certification.auditType] || 'audit'}
                 {certification.category ? ` at ${certification.category}` : ''}: {certification.ceilingLabel}.
               </div>
+            </>
+          )}
+
+          {note && (
+            <>
+              <div style={rule} />
+              <div style={{ fontSize: '12px', color: C.muted, lineHeight: '1.5' }}>{note}</div>
             </>
           )}
         </div>

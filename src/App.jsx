@@ -8,7 +8,10 @@ import AuditSummary from "./AuditSummary.jsx";
 import { score as frameworkScore } from "./framework/scoring.js";
 import { certify as frameworkCertify } from "./framework/certification.js";
 import { NA_REASON } from "./framework/weights.js";
-import { buildSnapshot, resolveScoringProfile } from "./framework/snapshot.js";
+import {
+  buildSnapshot, resolveScoringProfile, classifyLoadedAudit, canFreeze,
+  SNAPSHOT_STATUS,
+} from "./framework/snapshot.js";
 import { catalogIndex, isApplicable } from "./framework/catalog.js";
 import { itemChangeIsMaterial, trailEntry } from "./framework/trail.js";
 
@@ -135,6 +138,11 @@ export default function AHPAudit() {
   // Item awaiting an N/A reason, and the frozen scoring basis for this audit.
   const [naPrompt, setNaPrompt]           = useState(null);
   const [snapshot, setSnapshot]           = useState(null);
+  // What this audit can say about its basis. A missing snapshot alone cannot
+  // distinguish an audit that has not started from one carried out before
+  // snapshots existed, and only the second must never freeze, so the answer is
+  // settled when the audit is loaded and carried from there.
+  const [snapshotStatus, setSnapshotStatus] = useState(SNAPSHOT_STATUS.NONE);
   // Trail entries wait here until the columns to receive them exist. Queued in
   // state and persisted with the audit so an offline auditor still leaves one.
   const [trailQueue, setTrailQueue]       = useState([]);
@@ -142,6 +150,24 @@ export default function AHPAudit() {
   // closing over state that would be stale by the time it runs.
   const snapshotRef                       = useRef(null);
   const trailRef                          = useRef([]);
+  // The lock effect reads the status through a ref as well as state. A ref
+  // updates the instant the audit is adopted, so grades and their status can
+  // never reach the effect one render apart — which is the whole window in
+  // which a legacy audit could be mistaken for a new one and frozen.
+  const snapshotStatusRef                 = useRef(SNAPSHOT_STATUS.NONE);
+
+  // Take on an audit that came from somewhere else: local storage, the items
+  // table, or a reviewer opening one. Whether a basis was ever recorded for it
+  // is decided here, once, and every path that loads an audit goes through it
+  // so none of them can reach a different answer.
+  const adoptAudit = useCallback((nextAudit, nextSnapshot) => {
+    const status = classifyLoadedAudit(nextSnapshot, nextAudit);
+    snapshotStatusRef.current = status;
+    snapshotRef.current = nextSnapshot || null;
+    setSnapshotStatus(status);
+    setSnapshot(nextSnapshot || null);
+    setAudit(nextAudit || {});
+  }, []);
   const [summaryDraft, setSummaryDraft]   = useState('');
   const [auditTier, setAuditTier]         = useState('full'); // desk | spot | full
   const [publishState, setPublishState]   = useState('idle'); // idle | saving | done | error
@@ -244,7 +270,11 @@ export default function AHPAudit() {
       const sys = SHIFT_SYSTEMS[nextProp.shiftCount] || SHIFT_SYSTEMS['3'];
 
       setProp(nextProp);
-      setAudit(nextAudit);
+      // No snapshot travels with a reviewed audit: the columns to hold one are
+      // prepared but unapplied, so every audit opened here is unfrozen. Passing
+      // null explicitly is what matters — leaving the previous audit's snapshot
+      // in state would score this one against another property's basis.
+      adoptAudit(nextAudit, null);
       setIds({ propertyId: row.property_id, auditId: row.id, auditRef: row.ref });
       setReviewMeta({ ref: row.ref, date: row.date, status: row.status, tier: row.tier });
       setReviewAuditId(row.id);
@@ -264,7 +294,9 @@ export default function AHPAudit() {
     setReviewAuditId(null);
     setReviewMeta(null);
     setIds({ propertyId: null, auditId: null, auditRef: null });
-    setAudit({});
+    // Clears the basis along with the audit. Left behind, it would follow the
+    // reviewer into the next audit they open.
+    adoptAudit({}, null);
     setActiveSection(null);
     setScreen('review');
   };
@@ -285,12 +317,13 @@ export default function AHPAudit() {
         if (raw) {
           const data = JSON.parse(raw);
           if (data.prop) setProp(data.prop);
-          if (data.audit) setAudit(data.audit);
           if (data.ids) setIds(data.ids);
           // A snapshot taken on a previous session is the audit's scoring basis
           // and must survive a reload, or the basis would silently re-form
-          // from whatever the property record says now.
-          if (data.snapshot) setSnapshot(data.snapshot);
+          // from whatever the property record says now. Grades that arrive
+          // without one were recorded before any basis was, and adoptAudit
+          // marks the audit legacy so the first-grade lock leaves it alone.
+          adoptAudit(data.audit, data.snapshot);
           if (data.trailQueue) setTrailQueue(data.trailQueue);
           const sys = SHIFT_SYSTEMS[data.prop && data.prop.shiftCount] || SHIFT_SYSTEMS['3'];
           setActiveShiftId(sys.shifts[0].id);
@@ -321,7 +354,12 @@ export default function AHPAudit() {
             // critical_failures payload and whether the audit meets the standard.
             remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time, critical: !!row.critical };
           });
-          setAudit(remoteAudit);
+          // Keeps whatever basis this session already holds — a snapshot taken
+          // locally is still this audit's basis after a remote pull. What it
+          // catches is the other case: grades arriving from the items table
+          // with no basis anywhere, which is a legacy audit and must not
+          // freeze against today's property.
+          adoptAudit(remoteAudit, snapshotRef.current);
         }
         setSyncState('synced');
       } catch (e) { setSyncState('error'); }
@@ -497,9 +535,13 @@ export default function AHPAudit() {
   // does. They were separate before: scoring read the snapshot while the
   // checklist read the live property, so editing the property mid-audit could
   // hide items that still counted against the audit.
+  //
+  // The status travels with it so the result can say which of the two it is
+  // reading. A legacy audit scores through the live property because there is
+  // nothing else to score it against, but it never reports that as a record.
   const scoringBasis = useMemo(
-    () => resolveScoringProfile(snapshot, prop),
-    [snapshot, prop],
+    () => resolveScoringProfile(snapshot, prop, snapshotStatus),
+    [snapshot, prop, snapshotStatus],
   );
   const captureProfile = scoringBasis.profile;
 
@@ -571,23 +613,34 @@ export default function AHPAudit() {
   // The snapshot is taken at the first graded item rather than at audit
   // creation, because setup is iterative and an auditor should be able to
   // correct the profile before starting. After it, the basis is fixed.
+  //
+  // Only an audit that has recorded nothing yet may freeze. An audit whose
+  // grades came out of storage without a basis is legacy: its conditions were
+  // never written down, today's property is not a record of them, and grading
+  // it further does not make one. It stays unfrozen for good.
   useEffect(() => {
-    if (snapshot) return;
-    const hasAnyGrade = Object.values(audit).some(
+    if (snapshot || !canFreeze(snapshotStatusRef.current)) return;
+    const started = Object.values(audit).some(
       (byShift) => Object.values(byShift || {}).some((e) => e && e.status),
     );
-    if (!hasAnyGrade || !prop.name) return;
+    if (!started || !prop.name) return;
+    snapshotStatusRef.current = SNAPSHOT_STATUS.FROZEN;
+    setSnapshotStatus(SNAPSHOT_STATUS.FROZEN);
     setSnapshot(buildSnapshot(prop, { auditType: auditTier, lockedAt: new Date().toISOString() }));
   }, [audit, prop, auditTier, snapshot]);
 
   // Queued rather than written: the columns and policies for the trail are
   // prepared but not yet applied, so nothing is sent to Supabase.
   // Keep the refs and the stored copy in step with the state they mirror.
+  //
+  // A reviewer never writes to the local store. Their audit is somebody else's
+  // and the store holds the auditor's own work in progress.
   useEffect(() => {
     snapshotRef.current = snapshot;
     trailRef.current = trailQueue;
+    if (readOnly) return;
     if (snapshot || trailQueue.length) persist(prop, audit, ids);
-  }, [snapshot, trailQueue, persist, prop, audit, ids]);
+  }, [snapshot, trailQueue, persist, prop, audit, ids, readOnly]);
 
   const recordTrail = useCallback((entry) => {
     setTrailQueue((q) => [...q, trailEntry({
@@ -1139,6 +1192,7 @@ export default function AHPAudit() {
           <AuditSummary
             result={frameworkResult}
             certification={frameworkCertification}
+            basis={scoringBasis}
             palette={C}
             onOpenFinding={openFinding}
           />
@@ -1178,6 +1232,7 @@ export default function AHPAudit() {
           <AuditSummary
             result={frameworkResult}
             certification={frameworkCertification}
+            basis={scoringBasis}
             palette={C}
             onOpenFinding={openFinding}
           />

@@ -68,19 +68,106 @@ function normaliseScope(scopeSections, auditType) {
 }
 
 /**
+ * What an audit is able to say about the basis it was scored against.
+ *
+ * A missing snapshot used to mean two different things — an audit that has not
+ * started yet, and an audit carried out before snapshots existed — and the
+ * first-grade lock could not tell them apart, so it treated an audit whose
+ * basis was never recorded as one about to record its first. That minted a
+ * snapshot from today's property, stamped it with today's date and the current
+ * framework version, and presented a reconstruction as a record.
+ *
+ * These four states keep the two apart. Only NONE may ever freeze.
+ */
+export const SNAPSHOT_STATUS = Object.freeze({
+  // No grades yet. A basis will be frozen at the first one.
+  NONE: 'none',
+  // A basis was recorded when grading began, and is what this audit is scored
+  // against.
+  FROZEN: 'frozen',
+  // Grades exist and no basis was ever recorded. There is nothing to recover:
+  // the conditions of the audit were not written down at the time. This never
+  // becomes FROZEN, because anything it froze would be today's guess wearing a
+  // historical timestamp.
+  LEGACY_UNFROZEN: 'legacy-unfrozen',
+  // A basis was recorded but cannot be read. Distinct from LEGACY_UNFROZEN:
+  // something was written down, so it is kept exactly as found and never
+  // overwritten, even though it cannot be used.
+  UNUSABLE: 'unusable',
+});
+
+/** The statuses that score against the live property rather than a record. */
+const UNFROZEN_STATUSES = Object.freeze([
+  SNAPSHOT_STATUS.NONE, SNAPSHOT_STATUS.LEGACY_UNFROZEN, SNAPSHOT_STATUS.UNUSABLE,
+]);
+
+/**
+ * Does this audit carry any recorded status at all?
+ *
+ * The shape is the console's: { itemId: { shiftId: { status } } }. Any status
+ * counts, N/A included, which matches what the first-grade lock has always
+ * treated as the start of an audit.
+ */
+export function hasAnyGrade(graded = {}) {
+  return Object.values(graded || {}).some(
+    (byShift) => Object.values(byShift || {}).some((e) => e && e.status),
+  );
+}
+
+/**
+ * The status of a snapshot considered on its own.
+ *
+ * Note what this cannot decide: with no snapshot it returns NONE, because
+ * whether grades mean "not started" or "carried out before snapshots existed"
+ * depends on where those grades came from, which is not visible in the state
+ * itself. Only the caller that loaded them knows. Use classifyLoadedAudit for
+ * that moment; this is for everything after it.
+ */
+export function snapshotStatusOf(snapshot) {
+  if (!snapshot) return SNAPSHOT_STATUS.NONE;
+  return isUsableSnapshot(snapshot) ? SNAPSHOT_STATUS.FROZEN : SNAPSHOT_STATUS.UNUSABLE;
+}
+
+/**
+ * The status of an audit at the moment it is loaded from storage.
+ *
+ * This is the only place a legacy audit can be recognised. Grades that arrive
+ * together with the audit were recorded in some earlier session; if no basis
+ * arrived with them, none was ever recorded, and none may be invented now.
+ */
+export function classifyLoadedAudit(snapshot, graded) {
+  if (snapshot) return snapshotStatusOf(snapshot);
+  return hasAnyGrade(graded) ? SNAPSHOT_STATUS.LEGACY_UNFROZEN : SNAPSHOT_STATUS.NONE;
+}
+
+/** May this audit still freeze a basis at its next grade? */
+export function canFreeze(status) {
+  return status === SNAPSHOT_STATUS.NONE;
+}
+
+/**
  * The profile the scoring engine should use for an audit.
  *
  * Prefers the snapshot. Falls back to the live property only when no snapshot
  * exists, which is the case for audits recorded before this module, and
  * reports which of the two it used so the caller can say so.
+ *
+ * `status` is what the caller established when the audit was loaded. Passing
+ * it is what lets the result tell a legacy audit from one that has simply not
+ * started; without it the two are indistinguishable and both read as NONE.
+ * It never changes the profile, only what the result admits about it.
  */
-export function resolveScoringProfile(snapshot, liveProp = {}) {
+export function resolveScoringProfile(snapshot, liveProp = {}, status = null) {
+  const declared = status || snapshotStatusOf(snapshot);
   if (isUsableSnapshot(snapshot)) {
     return {
       profile: { category: snapshot.propertyCategory, ...withDependencyDefaults(snapshot.facilityProfile) },
       auditType: snapshot.auditType || DEFAULT_AUDIT_TYPE,
       scopeSections: snapshot.scopeSections || null,
       source: 'snapshot',
+      status: SNAPSHOT_STATUS.FROZEN,
+      frozen: true,
+      lockedAt: snapshot.lockedAt || null,
       frameworkVersion: snapshot.frameworkVersion || null,
       checklistVersion: snapshot.checklistVersion || null,
     };
@@ -95,9 +182,21 @@ export function resolveScoringProfile(snapshot, liveProp = {}) {
     scopeSections: null,
     // Named so a reviewer can tell a reconstructed basis from a recorded one.
     source: 'live-property-fallback',
+    // A frozen status can never be reported here: this branch only runs when
+    // there was no readable snapshot to freeze against.
+    status: declared === SNAPSHOT_STATUS.FROZEN ? SNAPSHOT_STATUS.UNUSABLE : declared,
+    frozen: false,
+    // Nothing is invented. An audit whose basis was never recorded has no lock
+    // date and no version, and says so rather than borrowing today's.
+    lockedAt: null,
     frameworkVersion: null,
     checklistVersion: null,
   };
+}
+
+/** Is this resolved basis a record of the audit, or today's stand-in for one? */
+export function isUnfrozenStatus(status) {
+  return UNFROZEN_STATUSES.includes(status);
 }
 
 /**
