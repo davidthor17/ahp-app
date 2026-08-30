@@ -17,6 +17,7 @@ import {
   buildSnapshot, resolveScoringProfile, withDependencyDefaults,
   DEPENDENCY_FLAGS, SECTION_FACILITY_FLAGS,
 } from '../src/framework/snapshot.js';
+import { FRAMEWORK, FRAMEWORK_VERSION, CHECKLIST_VERSION } from '../src/framework/version.js';
 import {
   AUDIT_TYPE, NA_REASON, FOUNDATION_ALLOWANCE, SPOT_CORE_SECTIONS, SPOT_MIN_ADDITIONAL_SECTIONS,
 } from '../src/framework/weights.js';
@@ -368,4 +369,56 @@ test('M. AHP-2026-8B10 regression', () => {
   assert.equal(c.level, 'none', 'still not certified');
   // The allowance is now a further reason, on top of the three it already had.
   assert.ok(c.reasons.some((r) => /11 of the fundamentals were not assessed/.test(r)), c.reasons.join(' | '));
+});
+
+// ── Phase 5.1: version stamping and the three flag states ────────────────
+
+test('a new snapshot is stamped with the current framework and checklist', () => {
+  const snap = buildSnapshot(FULL_5, { auditType: AUDIT_TYPE.FULL });
+  assert.equal(snap.frameworkVersion, FRAMEWORK_VERSION);
+  assert.equal(snap.checklistVersion, CHECKLIST_VERSION);
+  assert.equal(snap.frameworkVersion, '1.3.0');
+  assert.equal(snap.checklistVersion, '1.2.0');
+  // The version constants live in exactly one place and travel from there.
+  assert.equal(FRAMEWORK.frameworkVersion, FRAMEWORK_VERSION);
+  assert.equal(FRAMEWORK.checklistVersion, CHECKLIST_VERSION);
+});
+
+test('an existing snapshot keeps the version it was stamped with', () => {
+  // An audit recorded under an older framework must read back as that
+  // framework, or the stamp is worthless.
+  const old = {
+    propertyCategory: '5★',
+    facilityProfile: { hasRestaurant: true, hasPool: true, hasSpa: true },
+    auditType: AUDIT_TYPE.FULL,
+    frameworkVersion: '1.0.0',
+    checklistVersion: '1.0.0',
+  };
+  const resolved = resolveScoringProfile(old, FULL_5);
+  assert.equal(resolved.frameworkVersion, '1.0.0', 'never rewritten to the current version');
+  assert.equal(resolved.checklistVersion, '1.0.0');
+  assert.equal(old.frameworkVersion, '1.0.0', 'and the snapshot object itself is not mutated');
+});
+
+test('an audit with no snapshot records no version at all', () => {
+  const resolved = resolveScoringProfile(null, FULL_5);
+  assert.equal(resolved.source, 'live-property-fallback');
+  assert.equal(resolved.frameworkVersion, null, 'a reconstructed basis must not claim a version');
+  assert.equal(resolved.checklistVersion, null);
+});
+
+test('a flag has three states and only false gates the item out', () => {
+  const base = { category: '5★', hasRestaurant: true, hasPool: true, hasSpa: true };
+  const has = (profile, id) => applicableItems(profile).some((i) => i.id === id);
+
+  for (const [id, flag] of [
+    ['SP-04', 'hasSauna'], ['SP-02', 'hasChangingRooms'], ['RM-10', 'hasMinibar'],
+    ['LUN-02', 'hasLunchService'], ['FAC-04', 'hasGym'],
+  ]) {
+    assert.equal(has({ ...base }, id), true, `${id}: absent flag reads as present`);
+    assert.equal(has({ ...base, [flag]: null }, id), true, `${id}: null reads as present`);
+    assert.equal(has({ ...base, [flag]: undefined }, id), true, `${id}: undefined reads as present`);
+    assert.equal(has({ ...base, [flag]: true }, id), true, `${id}: true keeps the item`);
+    assert.equal(has({ ...base, [flag]: false }, id), false, `${id}: only false removes it`);
+  }
 });

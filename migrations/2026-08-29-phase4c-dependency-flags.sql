@@ -17,12 +17,20 @@
 
 begin;
 
+-- Nullable, with no default. Null means nobody has been asked yet, which is
+-- the truth for all seven existing properties: nothing in the schema
+-- establishes any of these five for any of them.
+--
+-- A not-null default of true would have been equally safe for scoring, since
+-- the engine reads a missing flag as present either way, but it would have
+-- erased the difference between "we know it is there" and "nobody has said",
+-- permanently and with no way to recover it. Null keeps the unknowns findable.
 alter table public.properties
-  add column if not exists has_sauna          boolean not null default true,
-  add column if not exists has_changing_rooms boolean not null default true,
-  add column if not exists has_minibar        boolean not null default true,
-  add column if not exists has_lunch_service  boolean not null default true,
-  add column if not exists has_gym            boolean not null default true;
+  add column if not exists has_sauna          boolean,
+  add column if not exists has_changing_rooms boolean,
+  add column if not exists has_minibar        boolean,
+  add column if not exists has_lunch_service  boolean,
+  add column if not exists has_gym            boolean;
 
 comment on column public.properties.has_sauna is
   'Gates SP-04. A spa without a sauna does not carry the item at all.';
@@ -38,19 +46,31 @@ comment on column public.properties.has_gym is
 commit;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- WHY THE DEFAULT IS TRUE
+-- WHY THE COLUMNS ARE NULLABLE
 --
--- default true means every existing row keeps every item it already had, so no
--- historical score can move and no audit can silently lose an applicable item.
--- The engine reads a missing or null flag as present for the same reason, in
--- withDependencyDefaults(). The two agree deliberately: false has to be a
--- recorded decision, never an absence of one.
+-- Three states matter and only two of them are booleans:
 --
--- The seven existing properties will all read as having a sauna, changing
--- rooms, a minibar, lunch service and a gym. That is wrong for some of them,
--- and it is the safe direction: it can only add items to an audit, never
--- remove them. Correcting a property is an ordinary edit, and once an audit
--- has started the snapshot freezes whatever was true at the time.
+--   true   the property has it, recorded by someone who looked
+--   false  the property does not have it, recorded by someone who looked
+--   null   nobody has been asked
+--
+-- Null is the truth for all seven existing rows. Nothing in the schema
+-- establishes a sauna, changing rooms, a minibar, lunch service or a gym for
+-- any of them, so writing true would state a fact nobody has established.
+--
+-- Scoring is unaffected either way: isApplicable() gates only on an explicit
+-- false, and rowToProp maps null to present, so a null flag keeps every item
+-- the property already had. No historical score can move and no audit can
+-- lose an applicable item. What null adds is that the unknowns stay findable:
+--
+--   select name from public.properties where has_gym is null;
+--
+-- With a not-null default that query returns nothing, forever.
+--
+-- The asymmetry is deliberate. A wrong true only adds requirements, which an
+-- auditor will notice and correct. A wrong false silently removes them, and
+-- nobody notices. So false has to be a recorded decision, never an absence of
+-- one, and null must never be read as false.
 --
 -- ─────────────────────────────────────────────────────────────────────────────
 -- HOW EXISTING ROWS BEHAVE
