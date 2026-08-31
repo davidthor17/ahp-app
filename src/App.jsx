@@ -11,7 +11,7 @@ import { NA_REASON } from "./framework/weights.js";
 import {
   buildSnapshot, resolveScoringProfile, classifyLoadedAudit, canFreeze,
   snapshotToRow, snapshotFromRow, pickSnapshot, shouldPersistSnapshot,
-  isUnfrozenStatus, SNAPSHOT_STATUS,
+  isUnfrozenStatus, isUsableSnapshot, SNAPSHOT_STATUS,
 } from "./framework/snapshot.js";
 import { catalogIndex, isApplicable } from "./framework/catalog.js";
 import { buildPublishedResult, validatePublishedResult } from "./framework/publishedResult.js";
@@ -24,6 +24,25 @@ import { itemChangeIsMaterial, trailEntry } from "./framework/trail.js";
 const SUPABASE_URL = "https://zbmhfdoqmzzscdklziss.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_s7RALrw2f5eXx5lMKGhqOw_isP5_II-";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ── TEMPORARY DIAGNOSTIC, Phase 5.7. Remove once the runtime is captured. ────
+//
+// The snapshot back-write does not fire in production and cannot be reproduced
+// locally: with the same state, session and audit row, the effect reaches the
+// update every time. This records which guard actually stops it in the real
+// runtime, and nothing else.
+//
+// Inert unless localStorage '__ahpDebug' is set, so it costs nothing and shows
+// nothing for anybody who has not opted in. Booleans and counts only: no
+// identifiers, no tokens, no auth data, no property or audit content.
+const DEBUG_KEY = '__ahpDebug';
+const debugOn = () => {
+  try { return !!localStorage.getItem(DEBUG_KEY); } catch (e) { return false; }
+};
+const dbg = (step, values) => {
+  if (!debugOn()) return;
+  window.__ahp = (window.__ahp || []).concat([{ step, ...values }]);
+};
 
 const SHIFT_SYSTEMS = {
   '2': { label: '2 shifts', shifts: [{ id: 'day', label: 'Day', time: '07:00–19:00' }, { id: 'night', label: 'Night', time: '19:00–07:00' }] },
@@ -388,6 +407,11 @@ export default function AHPAudit() {
         const rowSnapshot = snapshotFromRow(auditRow);
         const picked = pickSnapshot(rowSnapshot, snapshotRef.current);
         rowSnapshotRef.current = rowSnapshot;
+        dbg('pull:done', {
+          rowSnapshotPresent: isUsableSnapshot(rowSnapshot),
+          pickedSource: picked.source,
+          itemCount: (items || []).length,
+        });
 
         if (items && items.length) {
           const remoteAudit = {};
@@ -711,12 +735,25 @@ export default function AHPAudit() {
   // a loop; the next graded item tries again, and until then the local cache
   // still holds the basis.
   const persistSnapshot = useCallback(async (frozen) => {
-    if (!session || readOnly || !ids.auditId) return;
+    dbg('persist:entry', {
+      hasSession: !!session,
+      readOnly,
+      hasAuditId: !!ids.auditId,
+      settled: writeSettledRef.current,
+      snapshotUsable: isUsableSnapshot(frozen),
+      rowSnapshotPresent: isUsableSnapshot(rowSnapshotRef.current),
+      shouldPersist: shouldPersistSnapshot(frozen, rowSnapshotRef.current),
+    });
+    if (!session || readOnly || !ids.auditId) { dbg('persist:stop', { at: 'session-or-ids' }); return; }
     // Another session got there first. Nothing more to attempt.
-    if (writeSettledRef.current) return;
-    if (!shouldPersistSnapshot(frozen, rowSnapshotRef.current)) return;
+    if (writeSettledRef.current) { dbg('persist:stop', { at: 'settled' }); return; }
+    if (!shouldPersistSnapshot(frozen, rowSnapshotRef.current)) { dbg('persist:stop', { at: 'shouldPersist' }); return; }
     const patch = snapshotToRow(frozen);
-    if (!patch) return;
+    if (!patch) { dbg('persist:stop', { at: 'no-patch' }); return; }
+    dbg('persist:reached-update', { patchColumnCount: Object.keys(patch).length });
+    // The diagnostic build never writes. With the flag off this line is a no-op
+    // and behaviour is exactly the current production build.
+    if (debugOn()) { dbg('persist:stop', { at: 'diagnostic-build-no-write' }); return; }
     try {
       const { data, error } = await supabase.from('audits')
         .update(patch)
@@ -773,6 +810,15 @@ export default function AHPAudit() {
   // writes as soon as one arrives. persistSnapshot carries all the safety, so
   // calling it repeatedly is cheap and cannot overwrite anything.
   useEffect(() => {
+    dbg('effect:run', {
+      hasSnapshot: !!snapshot,
+      snapshotUsable: isUsableSnapshot(snapshot),
+      gradedItemCount: Object.keys(audit || {}).length,
+      hasAuditId: !!ids.auditId,
+      hasSession: !!session,
+      readOnly,
+      rowSnapshotPresent: isUsableSnapshot(rowSnapshotRef.current),
+    });
     if (!snapshot) return;
     persistSnapshot(snapshot);
   }, [snapshot, audit, persistSnapshot]);
