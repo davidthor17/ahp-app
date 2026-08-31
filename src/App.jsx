@@ -173,6 +173,10 @@ export default function AHPAudit() {
   // The basis as the audit row holds it, so the lock effect can tell a first
   // freeze from a re-freeze without another round trip.
   const rowSnapshotRef                    = useRef(null);
+  // Set only when another session established the basis first, so this one
+  // stops attempting a write it can never win. A failed write leaves it alone,
+  // which is what keeps the retry alive.
+  const writeSettledRef                   = useRef(false);
 
   // Take on an audit that came from somewhere else: local storage, the items
   // table, or a reviewer opening one. Whether a basis was ever recorded for it
@@ -708,6 +712,8 @@ export default function AHPAudit() {
   // still holds the basis.
   const persistSnapshot = useCallback(async (frozen) => {
     if (!session || readOnly || !ids.auditId) return;
+    // Another session got there first. Nothing more to attempt.
+    if (writeSettledRef.current) return;
     if (!shouldPersistSnapshot(frozen, rowSnapshotRef.current)) return;
     const patch = snapshotToRow(frozen);
     if (!patch) return;
@@ -718,10 +724,17 @@ export default function AHPAudit() {
         .is('snapshot_locked_at', null)
         .select('snapshot_locked_at').maybeSingle();
       if (error) throw error;
-      // No row came back: another session locked it first. Theirs stands.
-      if (data) rowSnapshotRef.current = frozen;
+      // A row came back: this write established the basis, so stop trying.
+      // Nothing came back: another session locked it first and theirs stands,
+      // so also stop trying, and let the next pull bring their basis down.
+      rowSnapshotRef.current = data ? frozen : rowSnapshotRef.current;
+      if (!data) writeSettledRef.current = true;
       setSyncState('synced');
-    } catch (e) { setSyncState('error'); }
+    } catch (e) {
+      // Left unset on purpose. rowSnapshotRef stays null, so the next change to
+      // the snapshot, the graded set or the session retries this write.
+      setSyncState('error');
+    }
   }, [session, readOnly, ids.auditId]);
 
   // The snapshot is taken at the first graded item rather than at audit
@@ -742,8 +755,27 @@ export default function AHPAudit() {
     snapshotStatusRef.current = SNAPSHOT_STATUS.FROZEN;
     setSnapshotStatus(SNAPSHOT_STATUS.FROZEN);
     setSnapshot(frozen);
-    persistSnapshot(frozen);
-  }, [audit, prop, auditTier, snapshot, persistSnapshot]);
+    // The row write is not done here. Setting the snapshot triggers the effect
+    // below, which is the single path to the row and the only one that retries.
+  }, [audit, prop, auditTier, snapshot]);
+
+  // Get the basis onto the audit row, whenever that becomes possible.
+  //
+  // Freezing and persisting are separate moments, and conflating them was a
+  // real hole: the write used to happen only at the instant of the first grade,
+  // so a basis frozen offline, or by a build older than row persistence, stayed
+  // in local storage for good. The lock effect returns early once a snapshot
+  // exists, so nothing ever went back for it.
+  //
+  // This runs on every change to the snapshot, the graded set, or the session,
+  // which gives retry for free: a write that fails leaves rowSnapshotRef null,
+  // so the next graded item tries again, and an audit frozen with no session
+  // writes as soon as one arrives. persistSnapshot carries all the safety, so
+  // calling it repeatedly is cheap and cannot overwrite anything.
+  useEffect(() => {
+    if (!snapshot) return;
+    persistSnapshot(snapshot);
+  }, [snapshot, audit, persistSnapshot]);
 
   // Queued rather than written: the columns and policies for the trail are
   // prepared but not yet applied, so nothing is sent to Supabase.

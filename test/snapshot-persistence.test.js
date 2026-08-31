@@ -273,3 +273,120 @@ test('11b. without the row, the same audit is honestly legacy rather than wrong'
   assert.equal(status, SNAPSHOT_STATUS.LEGACY_UNFROZEN);
   assert.equal(canFreeze(status), false);
 });
+
+// ── the back-write: getting an already frozen basis onto the row ────────────
+//
+// Found in production. persistSnapshot had one call site, inside the lock
+// effect, and that effect returns early once a snapshot exists. So the row was
+// written only at the instant of the first grade, and never afterwards. A basis
+// frozen offline, or by a build older than row persistence, stayed in local
+// storage for good: AHP-2026-SZFB was frozen under the previous bundle and its
+// six columns were still null after the new one shipped.
+//
+// The model below mirrors the console's guards exactly: persistSnapshot's three
+// early returns, then shouldPersistSnapshot, then the conditional update.
+
+/**
+ * What the console would do on one pass of the back-write effect.
+ * `rowSnapshot` is what this session believes the row holds, which is null
+ * until a pull says otherwise or a write of its own succeeds.
+ */
+function backWrite(state) {
+  const { localSnapshot, rowSnapshot, session, readOnly, auditId, settled } = state;
+  if (!localSnapshot) return 'no-snapshot';
+  if (!session || readOnly || !auditId) return 'no-session';
+  if (settled) return 'settled-elsewhere';
+  if (!shouldPersistSnapshot(localSnapshot, rowSnapshot)) return 'row-already-has-basis';
+  return 'write';
+}
+
+const online = (over = {}) => ({
+  localSnapshot: frozen(), rowSnapshot: null,
+  session: { user: { id: 'u1' } }, readOnly: false, auditId: 'a1', settled: false,
+  ...over,
+});
+
+test('back-write: a local basis with an empty row is written once', () => {
+  const state = online();
+  assert.equal(backWrite(state), 'write');
+
+  // The write succeeds, so the session now knows the row holds it.
+  state.rowSnapshot = state.localSnapshot;
+  assert.equal(backWrite(state), 'row-already-has-basis', 'and is not written twice');
+});
+
+test('back-write: a row that already holds a basis is never overwritten', () => {
+  const established = buildSnapshot({ ...PROP, category: '5★' }, FULL);
+  const stale = buildSnapshot({ ...PROP, category: '4★' }, { ...FULL, lockedAt: '2026-12-01T00:00:00.000Z' });
+  assert.equal(backWrite(online({ localSnapshot: stale, rowSnapshot: established })), 'row-already-has-basis');
+  // And the established basis is what scores, whatever local storage holds.
+  assert.equal(pickSnapshot(established, stale).snapshot.propertyCategory, '5★');
+});
+
+test('back-write: no local snapshot means no write, and nothing is invented', () => {
+  assert.equal(backWrite(online({ localSnapshot: null })), 'no-snapshot');
+  assert.equal(backWrite(online({ localSnapshot: null, rowSnapshot: null })), 'no-snapshot');
+  // A legacy audit reaches here with no snapshot and must stay that way.
+  assert.equal(classifyLoadedAudit(null, { 'RM-01': { day: { status: 'met' } } }),
+    SNAPSHOT_STATUS.LEGACY_UNFROZEN);
+});
+
+test('back-write: no session means no write', () => {
+  assert.equal(backWrite(online({ session: null })), 'no-session');
+  assert.equal(backWrite(online({ auditId: null })), 'no-session');
+  assert.equal(backWrite(online({ readOnly: true })), 'no-session', 'a reviewer never writes');
+});
+
+test('back-write: an audit frozen offline is persisted when the session arrives', () => {
+  // The offline case, which the old single call site could never recover from.
+  const state = online({ session: null });
+  assert.equal(backWrite(state), 'no-session', 'nothing while offline');
+
+  state.session = { user: { id: 'u1' } };
+  assert.equal(backWrite(state), 'write', 'and written as soon as there is a session');
+});
+
+test('back-write: a failed write is retried, and stops once it succeeds', () => {
+  const state = online();
+  const attempts = [];
+
+  // Attempt one fails: rowSnapshot is left null on purpose.
+  attempts.push(backWrite(state));
+  // Attempt two, triggered by the next graded item.
+  attempts.push(backWrite(state));
+  // Attempt three succeeds and records the row.
+  attempts.push(backWrite(state));
+  state.rowSnapshot = state.localSnapshot;
+  attempts.push(backWrite(state));
+
+  assert.deepEqual(attempts, ['write', 'write', 'write', 'row-already-has-basis']);
+});
+
+test('back-write: another session winning the race settles it', () => {
+  // The conditional update matched no row, so theirs stands and this session
+  // stops trying rather than retrying forever.
+  const state = online({ settled: true });
+  assert.equal(backWrite(state), 'settled-elsewhere');
+});
+
+test('back-write: once persisted, the row stays authoritative', () => {
+  const rowBasis = buildSnapshot({ ...PROP, category: '5★' }, FULL);
+  const localBasis = buildSnapshot({ ...PROP, category: '4★' }, { ...FULL, lockedAt: '2026-01-01T00:00:00.000Z' });
+
+  const picked = pickSnapshot(rowBasis, localBasis);
+  assert.equal(picked.source, 'audit-row');
+  assert.equal(picked.snapshot.propertyCategory, '5★');
+
+  const basis = resolveScoringProfile(picked.snapshot, { category: 'Ultra' }, SNAPSHOT_STATUS.FROZEN);
+  assert.equal(basis.frozen, true);
+  assert.equal(basis.profile.category, '5★', 'not the cache, and not the live property');
+});
+
+test('back-write: the row patch is the same six columns as a first freeze', () => {
+  // A back-write is not a different kind of write. Same payload, same columns.
+  const basis = frozen();
+  assert.deepEqual(snapshotToRow(basis), snapshotToRow(basis));
+  assert.deepEqual(Object.keys(snapshotToRow(basis)).sort(), [...SNAPSHOT_COLUMNS].sort());
+  assert.equal(snapshotToRow(basis).snapshot_locked_at, LOCKED_AT,
+    'the original lock date, not the moment of the back-write');
+});
