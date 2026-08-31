@@ -10,7 +10,8 @@ import { certify as frameworkCertify } from "./framework/certification.js";
 import { NA_REASON } from "./framework/weights.js";
 import {
   buildSnapshot, resolveScoringProfile, classifyLoadedAudit, canFreeze,
-  SNAPSHOT_STATUS,
+  snapshotToRow, snapshotFromRow, pickSnapshot, shouldPersistSnapshot,
+  isUnfrozenStatus, SNAPSHOT_STATUS,
 } from "./framework/snapshot.js";
 import { catalogIndex, isApplicable } from "./framework/catalog.js";
 import { buildPublishedResult, validatePublishedResult } from "./framework/publishedResult.js";
@@ -169,6 +170,9 @@ export default function AHPAudit() {
   // never reach the effect one render apart — which is the whole window in
   // which a legacy audit could be mistaken for a new one and frozen.
   const snapshotStatusRef                 = useRef(SNAPSHOT_STATUS.NONE);
+  // The basis as the audit row holds it, so the lock effect can tell a first
+  // freeze from a re-freeze without another round trip.
+  const rowSnapshotRef                    = useRef(null);
 
   // Take on an audit that came from somewhere else: local storage, the items
   // table, or a reviewer opening one. Whether a basis was ever recorded for it
@@ -188,6 +192,9 @@ export default function AHPAudit() {
   // Why a publish failed, so the message can say something useful. A missing
   // column is not a connection problem and retrying will not help.
   const [publishReason, setPublishReason] = useState(null);
+  // Publishing an audit with no recorded basis needs an explicit
+  // acknowledgement. A frozen audit never sees it.
+  const [legacyAck, setLegacyAck]         = useState(false);
 
   // ---------- reviewer (read-only external access) ----------
   // profile is the caller's own auditors row. The database is the security
@@ -282,6 +289,7 @@ export default function AHPAudit() {
         nextAudit[r.item_id] = nextAudit[r.item_id] || {};
         nextAudit[r.item_id][r.shift_id] = {
           status: r.status, note: r.note, time: r.time, critical: r.critical,
+          naReason: r.na_reason || null,
         };
       });
       const sys = SHIFT_SYSTEMS[nextProp.shiftCount] || SHIFT_SYSTEMS['3'];
@@ -359,9 +367,24 @@ export default function AHPAudit() {
     if (!session || !ids.auditId) return;
     (async () => {
       try {
+        // The audit row carries the frozen basis, and it outranks local
+        // storage. Local storage is a cache that lets an offline auditor keep
+        // working; the row is what an audit actually was scored against, and it
+        // is the only copy that survives a lost browser profile.
+        const { data: auditRow, error: aErr } = await supabase
+          .from('audits')
+          .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at')
+          .eq('id', ids.auditId).single();
+        if (aErr) throw aErr;
+
         const { data: items, error } = await supabase
           .from('audit_items').select('*').eq('audit_id', ids.auditId);
         if (error) throw error;
+
+        const rowSnapshot = snapshotFromRow(auditRow);
+        const picked = pickSnapshot(rowSnapshot, snapshotRef.current);
+        rowSnapshotRef.current = rowSnapshot;
+
         if (items && items.length) {
           const remoteAudit = {};
           items.forEach(row => {
@@ -369,14 +392,16 @@ export default function AHPAudit() {
             // critical must be carried across too: it is written by pushItem, it
             // drives getCriticalFailures(), and that decides both the published
             // critical_failures payload and whether the audit meets the standard.
-            remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time, critical: !!row.critical };
+            // na_reason likewise: without it a structural N/A returns reasonless
+            // and is read as observational, which quietly moves the item back
+            // into scope and costs the audit coverage it had already excluded.
+            remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time, critical: !!row.critical, naReason: row.na_reason || null };
           });
-          // Keeps whatever basis this session already holds — a snapshot taken
-          // locally is still this audit's basis after a remote pull. What it
-          // catches is the other case: grades arriving from the items table
-          // with no basis anywhere, which is a legacy audit and must not
-          // freeze against today's property.
-          adoptAudit(remoteAudit, snapshotRef.current);
+          adoptAudit(remoteAudit, picked.snapshot);
+        } else if (picked.snapshot !== snapshotRef.current) {
+          // No items yet, but the row already holds a basis. Adopt it anyway so
+          // a second session cannot start a fresh one alongside it.
+          adoptAudit(audit, picked.snapshot);
         }
         setSyncState('synced');
       } catch (e) { setSyncState('error'); }
@@ -466,7 +491,7 @@ export default function AHPAudit() {
         from: shiftPrev.status || null, to: status === 'na' && reason ? `na:${reason}` : status,
       });
     }
-    if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status, time, note: shiftPrev.note || null, critical: !!shiftPrev.critical });
+    if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status, time, note: shiftPrev.note || null, critical: !!shiftPrev.critical, na_reason: reason, na_note: null });
   };
 
   // Opens the reason sheet rather than writing N/A directly. Every other status
@@ -479,7 +504,7 @@ export default function AHPAudit() {
     const shiftPrev = prev[activeShiftId] || {};
     const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, note } } };
     setAudit(updated); persist(prop, updated, ids);
-    if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note, time: shiftPrev.time || null, critical: !!shiftPrev.critical });
+    if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note, time: shiftPrev.time || null, critical: !!shiftPrev.critical, na_reason: shiftPrev.naReason || null, na_note: null });
   };
 
   const toggleCritical = (itemId) => {
@@ -488,7 +513,7 @@ export default function AHPAudit() {
     const critical = !shiftPrev.critical;
     const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, critical } } };
     setAudit(updated); persist(prop, updated, ids);
-    if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note: shiftPrev.note || null, time: shiftPrev.time || null, critical });
+    if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note: shiftPrev.note || null, time: shiftPrev.time || null, critical, na_reason: shiftPrev.naReason || null, na_note: null });
   };
 
   // every item ever flagged critical, across all shifts, regardless of current shift selection
@@ -663,6 +688,42 @@ export default function AHPAudit() {
     [frameworkResult, auditTier, scoringBasis],
   );
 
+  // Does publishing this audit need the legacy acknowledgement?
+  //
+  // Only an audit that has actually recorded something and has no readable
+  // basis. An audit with nothing graded is not legacy, it simply has not
+  // started, and it cannot be published anyway. A frozen audit never sees it.
+  const needsLegacyAck = !scoringBasis.frozen
+    && isUnfrozenStatus(snapshotStatus)
+    && snapshotStatus !== SNAPSHOT_STATUS.NONE;
+
+  // Write the frozen basis onto the audit row, once.
+  //
+  // Guarded three ways, because this is the one write that could overwrite a
+  // record of what an audit was actually scored against: it needs a readable
+  // snapshot, the row must not already hold one, and the update itself is
+  // conditional on `snapshot_locked_at is null` so a stale client racing a
+  // fresh one changes nothing. A failure is left alone rather than retried into
+  // a loop; the next graded item tries again, and until then the local cache
+  // still holds the basis.
+  const persistSnapshot = useCallback(async (frozen) => {
+    if (!session || readOnly || !ids.auditId) return;
+    if (!shouldPersistSnapshot(frozen, rowSnapshotRef.current)) return;
+    const patch = snapshotToRow(frozen);
+    if (!patch) return;
+    try {
+      const { data, error } = await supabase.from('audits')
+        .update(patch)
+        .eq('id', ids.auditId)
+        .is('snapshot_locked_at', null)
+        .select('snapshot_locked_at').maybeSingle();
+      if (error) throw error;
+      // No row came back: another session locked it first. Theirs stands.
+      if (data) rowSnapshotRef.current = frozen;
+      setSyncState('synced');
+    } catch (e) { setSyncState('error'); }
+  }, [session, readOnly, ids.auditId]);
+
   // The snapshot is taken at the first graded item rather than at audit
   // creation, because setup is iterative and an auditor should be able to
   // correct the profile before starting. After it, the basis is fixed.
@@ -677,10 +738,12 @@ export default function AHPAudit() {
       (byShift) => Object.values(byShift || {}).some((e) => e && e.status),
     );
     if (!started || !prop.name) return;
+    const frozen = buildSnapshot(prop, { auditType: auditTier, lockedAt: new Date().toISOString() });
     snapshotStatusRef.current = SNAPSHOT_STATUS.FROZEN;
     setSnapshotStatus(SNAPSHOT_STATUS.FROZEN);
-    setSnapshot(buildSnapshot(prop, { auditType: auditTier, lockedAt: new Date().toISOString() }));
-  }, [audit, prop, auditTier, snapshot]);
+    setSnapshot(frozen);
+    persistSnapshot(frozen);
+  }, [audit, prop, auditTier, snapshot, persistSnapshot]);
 
   // Queued rather than written: the columns and policies for the trail are
   // prepared but not yet applied, so nothing is sent to Supabase.
@@ -1364,12 +1427,41 @@ export default function AHPAudit() {
             </div>
           )}
 
-          <button disabled={!session || publishState === 'saving'} onClick={async () => {
+          {/* An audit with no recorded basis can still be published, but not by
+              accident. The public report will carry a permanent line saying the
+              basis was never recorded, and that cannot be taken back later, so
+              the auditor has to say they know. A frozen audit sees none of this. */}
+          {needsLegacyAck && (
+            <div style={{ marginBottom: '16px', padding: '14px 16px', borderRadius: '9px', background: C.surface2, border: `1px solid ${C.border}` }}>
+              <div style={{ fontSize: '13px', fontWeight: '600', marginBottom: '7px', color: C.text }}>
+                This audit has no recorded scoring basis
+              </div>
+              <div style={{ fontSize: '12.5px', color: C.dim, lineHeight: '1.55', marginBottom: '11px' }}>
+                It was carried out before the property details behind each assessment were recorded,
+                or that record was lost. The result is scored against the property as it stands
+                today, so it cannot be reproduced as history. The public report will say so, and
+                that line stays on it permanently.
+              </div>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: '9px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={legacyAck}
+                  onChange={e => setLegacyAck(e.target.checked)}
+                  style={{ marginTop: '3px', accentColor: C.gold, width: '15px', height: '15px', flexShrink: 0, cursor: 'pointer' }}
+                />
+                <span style={{ fontSize: '12.5px', color: C.text, lineHeight: '1.5' }}>
+                  I understand, and I am publishing this as a legacy audit.
+                </span>
+              </label>
+            </div>
+          )}
+
+          <button disabled={!session || publishState === 'saving' || (needsLegacyAck && !legacyAck)} onClick={async () => {
             setPublishState('saving');
             const res = await publishAudit(summaryDraft, auditTier);
             setPublishReason(res.ok ? null : (res.reason || 'error'));
             setPublishState(res.ok ? 'done' : 'error');
-          }} style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: session ? C.gold : C.surface2, color: session ? '#0C0C0F' : C.muted, fontSize: '14px', fontWeight: '700', letterSpacing: '0.06em', cursor: session ? 'pointer' : 'default' }}>
+          }} style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: (session && !(needsLegacyAck && !legacyAck)) ? C.gold : C.surface2, color: (session && !(needsLegacyAck && !legacyAck)) ? '#0C0C0F' : C.muted, fontSize: '14px', fontWeight: '700', letterSpacing: '0.06em', cursor: session ? 'pointer' : 'default' }}>
             {publishState === 'saving' ? 'PUBLISHING…' : publishState === 'done' ? 'PUBLISHED ✓' : 'PUBLISH AUDIT'}
           </button>
           {/* A failed publish says which kind of failure it was. The schema case

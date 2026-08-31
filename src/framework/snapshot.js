@@ -276,3 +276,82 @@ export function isFavourableScopeChange(snapshot, nextScope) {
   if (!Array.isArray(nextScope)) return false;
   return snapshot.scopeSections.some((s) => !nextScope.includes(s));
 }
+
+// ── Persistence ─────────────────────────────────────────────────────────────
+//
+// A snapshot lived only in React state and localStorage, which made it the one
+// part of an audit that could not survive a lost browser profile. The columns
+// to hold it are added by migrations/2026-08-28-phase4b-scoring-integrity.sql.
+//
+// The audit row is authoritative. Local storage is a cache that lets an offline
+// auditor keep working, and it is consulted only when the row carries nothing.
+// A row that already holds a basis is never replaced from local state: one
+// client writes it once, and a stale cache must not be able to overwrite it.
+
+/** The six audits columns a frozen snapshot occupies. */
+export const SNAPSHOT_COLUMNS = Object.freeze([
+  'property_category', 'facility_profile', 'scope_sections',
+  'framework_version', 'checklist_version', 'snapshot_locked_at',
+]);
+
+/**
+ * A frozen snapshot as an audits-row patch.
+ * Returns null when there is nothing worth persisting, so a caller cannot
+ * accidentally write a half-formed basis.
+ */
+export function snapshotToRow(snapshot) {
+  if (!isUsableSnapshot(snapshot)) return null;
+  return {
+    property_category: snapshot.propertyCategory,
+    facility_profile: snapshot.facilityProfile,
+    scope_sections: snapshot.scopeSections || null,
+    framework_version: snapshot.frameworkVersion || null,
+    checklist_version: snapshot.checklistVersion || null,
+    snapshot_locked_at: snapshot.lockedAt || null,
+  };
+}
+
+/**
+ * Read a snapshot back out of an audits row.
+ *
+ * `snapshot_locked_at` is the marker: a row without it never froze, whatever
+ * else the columns happen to hold. Returns null rather than a partial snapshot,
+ * so a row with some columns set and no lock date reads as no basis at all
+ * rather than as a basis nobody recorded.
+ */
+export function snapshotFromRow(row) {
+  if (!row || !row.snapshot_locked_at || !row.property_category) return null;
+  const snapshot = {
+    propertyCategory: row.property_category,
+    facilityProfile: row.facility_profile || null,
+    auditType: row.tier || DEFAULT_AUDIT_TYPE,
+    scopeSections: row.scope_sections || null,
+    frameworkVersion: row.framework_version || null,
+    checklistVersion: row.checklist_version || null,
+    lockedAt: row.snapshot_locked_at,
+  };
+  return isUsableSnapshot(snapshot) ? snapshot : null;
+}
+
+/**
+ * Which snapshot an audit should be loaded with, given both sources.
+ *
+ * The order the rollout settled on: the persisted row first, local storage
+ * second, and nothing invented if neither has one. Returning the source as well
+ * as the snapshot lets the caller record where a basis came from without
+ * re-deriving it.
+ */
+export function pickSnapshot(rowSnapshot, localSnapshot) {
+  if (isUsableSnapshot(rowSnapshot)) return { snapshot: rowSnapshot, source: 'audit-row' };
+  if (isUsableSnapshot(localSnapshot)) return { snapshot: localSnapshot, source: 'local-cache' };
+  // A truthy but unreadable local snapshot is kept rather than discarded: it is
+  // something somebody wrote down, and classifyLoadedAudit reports it as
+  // unusable rather than pretending the audit never had a basis.
+  if (localSnapshot) return { snapshot: localSnapshot, source: 'local-cache' };
+  return { snapshot: null, source: 'none' };
+}
+
+/** May this audit's basis be written to its row? Only a real, first lock. */
+export function shouldPersistSnapshot(snapshot, rowSnapshot) {
+  return isUsableSnapshot(snapshot) && !isUsableSnapshot(rowSnapshot);
+}

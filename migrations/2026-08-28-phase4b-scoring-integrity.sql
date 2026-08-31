@@ -118,26 +118,27 @@ commit;
 -- Dropping loses any snapshot recorded since the migration ran, so take a
 -- snapshot of public.audits first if any audit has been graded by then.
 
--- ─────────────────────────────────────────────────────────────────────────────
--- BACKFILLING THE SEVEN EXISTING AUDITS
+-- NO BACKFILL, EVER
 --
--- Deliberately a separate, unwritten step. The only basis available is the
--- property row as it stands today, which is a reconstruction rather than a
--- record: nobody knows whether those properties have changed since. Presenting
--- a reconstruction as a recorded fact is the very thing this phase exists to
--- prevent, so it needs its own decision.
+-- There is deliberately no statement here that populates these columns for an
+-- existing audit, and none should ever be added. The only basis available for a
+-- historical audit is the property row as it stands today, which is a
+-- reconstruction and not a record: nobody knows whether those properties have
+-- changed since, and writing today's values would state as recorded fact
+-- conditions nobody wrote down.
 --
--- If approved, it would look like this, and would want an accompanying
--- activity_log entry per audit marking the values as reconstructed:
+-- A draft of such a statement previously sat here as a comment. It was removed
+-- rather than left commented, because a commented-out UPDATE beside a column
+-- full of nulls is an invitation, and the nulls are the correct value.
 --
---   update public.audits a
---      set property_category = p.category,
---          facility_profile  = jsonb_build_object(
---            'hasRestaurant', p.has_restaurant,
---            'hasPool',       p.has_pool,
---            'hasSpa',        p.has_spa),
---          framework_version = null,        -- unknown, and honest about it
---          checklist_version = null
---     from public.properties p
---    where p.id = a.property_id
---      and a.property_category is null;
+-- An audit with grades and no basis is legacy. The console classifies it that
+-- way, refuses to freeze it, and publishes it with basis.state "legacy" and no
+-- invented recordedOn. The public report says so in one line. That is the whole
+-- handling, and it needs no data.
+--
+--   AHP-2026-8B10   published, legacy, never to be backfilled
+--   AHP-2026-D699   draft with grades, legacy, may be continued and published as legacy
+--   AHP-2026-1XZY   draft with grades, legacy, may be continued and published as legacy
+--
+-- The remaining four audits hold no grades at all, so they are not legacy: they
+-- have recorded nothing, and will freeze normally at their first graded item.
