@@ -17,6 +17,10 @@ import { catalogIndex, isApplicable } from "./framework/catalog.js";
 import { buildPublishedResult, validatePublishedResult } from "./framework/publishedResult.js";
 import { dependencyFlagsToRow, dependencyFlagsFromRow } from "./framework/propertyFlags.js";
 import { itemChangeIsMaterial, trailEntry } from "./framework/trail.js";
+import {
+  SYNC, createQueue, queueWrite, clearWrite, pendingCount as queuedCount,
+  pendingEntries, resolveSyncState, syncLabel, applyPending,
+} from "./framework/syncQueue.js";
 
 // Settings → API in your Supabase project → Project URL + anon public key.
 // Safe to expose in client code — access is governed by the RLS policies
@@ -128,6 +132,13 @@ export default function AHPAudit() {
   const [authError, setAuthError]         = useState('');
   const [authBusy, setAuthBusy]           = useState(false);
   const [syncState, setSyncState]         = useState('offline'); // offline | synced | error
+  // Item writes that have been made but not yet accepted by the server. Held
+  // in a ref because the flush must read the current queue, not the one that
+  // existed when a render closed over it; mirrored into state only so the
+  // header re-renders when the count changes.
+  const pendingRef                        = useRef(createQueue());
+  const [pendingWrites, setPendingWrites] = useState(0);
+  const flushingRef                       = useRef(false);
   const [ids, setIds]                     = useState({ propertyId: null, auditId: null, auditRef: null });
   const [prop, setProp]                   = useState({
     name: '', city: '', country: '', chain: false, chainName: '',
@@ -177,6 +188,10 @@ export default function AHPAudit() {
   // stops attempting a write it can never win. A failed write leaves it alone,
   // which is what keeps the retry alive.
   const writeSettledRef                   = useRef(false);
+  // The tier is part of what an audit is, not a choice made fresh each time the
+  // app starts. persist() is stable and reads it here rather than closing over
+  // state that would be stale by the time it runs.
+  const auditTierRef                      = useRef('full');
 
   // Take on an audit that came from somewhere else: local storage, the items
   // table, or a reviewer opening one. Whether a basis was ever recorded for it
@@ -199,6 +214,7 @@ export default function AHPAudit() {
   // Publishing an audit with no recorded basis needs an explicit
   // acknowledgement. A frozen audit never sees it.
   const [legacyAck, setLegacyAck]         = useState(false);
+  useEffect(() => { auditTierRef.current = auditTier; }, [auditTier]);
 
   // ---------- reviewer (read-only external access) ----------
   // profile is the caller's own auditors row. The database is the security
@@ -234,6 +250,13 @@ export default function AHPAudit() {
   const role         = profile && profile.role ? profile.role : null;
   const isReviewer   = role === 'reviewer';
   const readOnly     = isReviewer;
+  // Who may open the audit list. The database already answers this: the
+  // "internal reads all audits" policy covers owner and auditor, and
+  // "reviewer reads all audits" covers the reviewer, so letting an auditor
+  // find a lost audit again needs no migration and no new policy. An auditor
+  // resumes it writable; a reviewer still opens it read only.
+  const isInternal   = role === 'auditor' || role === 'owner';
+  const canBrowse    = isInternal || isReviewer;
   const expiresAt    = profile && profile.access_expires_at ? profile.access_expires_at : null;
   // Expiry is enforced by the database. This only picks the right empty state
   // so the reviewer sees a sentence instead of an empty list.
@@ -250,7 +273,7 @@ export default function AHPAudit() {
   // Audit list for the reviewer browse screen. RLS returns every audit for a
   // reviewer and only published ones for anybody else, so this needs no filter.
   useEffect(() => {
-    if (screen !== 'review' || !session || !isReviewer) return;
+    if (screen !== 'review' || !session || !canBrowse) return;
     // Deliberately does not touch openError: returning to this screen after a
     // failed open would otherwise clear the message before it could be read.
     setBrowseLoading(true); setBrowseError(false);
@@ -262,7 +285,7 @@ export default function AHPAudit() {
         if (error) { setBrowseError(true); return; }
         setAuditsList(data || []);
       });
-  }, [screen, session, isReviewer]);
+  }, [screen, session, canBrowse]);
 
   const signIn = async () => {
     setAuthError('');
@@ -319,6 +342,86 @@ export default function AHPAudit() {
     }
   };
 
+  /**
+   * Re-open one of the auditor's own audits, writable.
+   *
+   * This is the answer to a lost localStorage. The ids that make an audit
+   * reachable lived only on the device, so a cleared browser, a private window
+   * or a new phone made a part finished audit unreachable even though every
+   * row was safe in the database. Recovering it needed SQL and a hand built
+   * storage blob, which is not something to be doing in a hotel.
+   *
+   * The basis comes from the audit row or it does not exist. snapshotFromRow
+   * returns null when the row never recorded one, classifyLoadedAudit then
+   * reads the audit as legacy-unfrozen, and canFreeze refuses it, so resuming
+   * an old audit can never mint a historical basis out of today's property
+   * record. That guarantee is the reason this does not simply call
+   * buildSnapshot, and it is the one thing here that must not be relaxed.
+   */
+  const resumeAudit = async (row) => {
+    // Resuming replaces what is on this device. Anything still queued belongs
+    // to the audit being left behind and would go with it, so this refuses
+    // rather than trading one recovered audit for another one's lost grades.
+    if (queuedCount(pendingRef.current) > 0) { setOpenError('pending'); return; }
+    setOpenError(false);
+    setScreen('loading');
+    try {
+      const { data: auditRow, error: aErr } = await supabase
+        .from('audits')
+        .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at')
+        .eq('id', row.id).maybeSingle();
+      if (aErr) throw aErr;
+
+      const { data: propRow, error: pErr } = await supabase
+        .from('properties').select('*').eq('id', row.property_id).single();
+      if (pErr) throw pErr;
+
+      const { data: items, error: iErr } = await supabase
+        .from('audit_items').select('*').eq('audit_id', row.id);
+      if (iErr) throw iErr;
+
+      const nextProp = rowToProp(propRow);
+      const nextAudit = {};
+      (items || []).forEach(r => {
+        nextAudit[r.item_id] = nextAudit[r.item_id] || {};
+        nextAudit[r.item_id][r.shift_id] = {
+          status: r.status, note: r.note, time: r.time, critical: !!r.critical,
+          naReason: r.na_reason || null,
+        };
+      });
+
+      // Recorded basis only. Never reconstructed.
+      const rowSnapshot = snapshotFromRow(auditRow);
+      rowSnapshotRef.current = rowSnapshot;
+      // A different audit is being taken up, so the previous audit's verdict on
+      // whether its basis write had been settled says nothing about this one.
+      writeSettledRef.current = false;
+
+      const sys = SHIFT_SYSTEMS[nextProp.shiftCount] || SHIFT_SYSTEMS['3'];
+      const nextIds = { propertyId: row.property_id, auditId: row.id, auditRef: row.ref };
+
+      setProp(nextProp);
+      adoptAudit(nextAudit, rowSnapshot);
+      setIds(nextIds);
+      if (auditRow && auditRow.tier && ['desk', 'spot', 'full'].includes(auditRow.tier)) {
+        auditTierRef.current = auditRow.tier;
+        setAuditTier(auditRow.tier);
+      }
+      setReviewAuditId(null);
+      setReviewMeta(null);
+      setActiveShiftId(sys.shifts[0].id);
+      setActiveSection(null);
+      setOpenNotes({});
+      setSyncState('synced');
+      // The device is now the audit's home again, so the cache matches the row.
+      persist(nextProp, nextAudit, nextIds);
+      setScreen('home');
+    } catch (e) {
+      setOpenError(true);
+      setScreen('review');
+    }
+  };
+
   const closeReviewAudit = () => {
     setReviewAuditId(null);
     setReviewMeta(null);
@@ -354,6 +457,12 @@ export default function AHPAudit() {
           // marks the audit legacy so the first-grade lock leaves it alone.
           adoptAudit(data.audit, data.snapshot);
           if (data.trailQueue) setTrailQueue(data.trailQueue);
+          // Only a tier this app recognises. A missing one means the audit
+          // predates tier persistence, and Full is what it was scored as.
+          if (data.auditTier && ['desk', 'spot', 'full'].includes(data.auditTier)) {
+            auditTierRef.current = data.auditTier;
+            setAuditTier(data.auditTier);
+          }
           const sys = SHIFT_SYSTEMS[data.prop && data.prop.shiftCount] || SHIFT_SYSTEMS['3'];
           setActiveShiftId(sys.shifts[0].id);
           setScreen(data.prop && data.prop.name ? 'home' : 'setup');
@@ -408,11 +517,22 @@ export default function AHPAudit() {
             // into scope and costs the audit coverage it had already excluded.
             remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time, critical: !!row.critical, naReason: row.na_reason || null };
           });
-          adoptAudit(remoteAudit, picked.snapshot);
+          // Anything still queued has not reached the database, so it is absent
+          // from what came back. Adopting the remote set as it stands would
+          // erase those grades from the device as well, which is how a sync
+          // failure became real data loss. The queue goes back on top.
+          adoptAudit(applyPending(remoteAudit, pendingRef.current), picked.snapshot);
         } else if (picked.snapshot !== snapshotRef.current) {
           // No items yet, but the row already holds a basis. Adopt it anyway so
           // a second session cannot start a fresh one alongside it.
           adoptAudit(audit, picked.snapshot);
+        }
+        // The tier the row already carries outranks whatever this session
+        // started with. It is written at publish, so before then it is null and
+        // this leaves the local choice alone.
+        if (auditRow && auditRow.tier && ['desk', 'spot', 'full'].includes(auditRow.tier)) {
+          auditTierRef.current = auditRow.tier;
+          setAuditTier(auditRow.tier);
         }
         // An audit that is not in the database is not synced, whatever else
         // succeeded. Saying otherwise would tell an auditor their work is
@@ -424,8 +544,21 @@ export default function AHPAudit() {
   }, [session, ids.auditId]);
 
   const persist = useCallback(async (p, a, i) => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ prop: p, audit: a, ids: i, snapshot: snapshotRef.current, trailQueue: trailRef.current })); } catch(e) {}
+    // auditTier travels with the audit. Left out, it reset to Full on every
+    // reload, and publishAudit writes whatever it holds to the row: a Spot
+    // Audit resumed after a reload would be published as a Full Audit and
+    // become eligible for the Mark it must never carry.
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ prop: p, audit: a, ids: i, snapshot: snapshotRef.current, trailQueue: trailRef.current, auditTier: auditTierRef.current })); } catch(e) {}
   }, []);
+
+  // Changing the tier is a change to the audit, and it is usually the last
+  // thing done before publishing. Nothing else calls persist() at that point,
+  // so without this the choice would live only in memory.
+  useEffect(() => {
+    if (readOnly || !prop.name) return;
+    persist(prop, audit, ids);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auditTier]);
 
   // creates (or reuses) the property + audit rows in Supabase once the auditor hits BEGIN AUDIT
   const ensureRemoteAudit = async () => {
@@ -465,19 +598,76 @@ export default function AHPAudit() {
     }
   };
 
-  const pushItem = async (auditId, itemId, shiftId, patch) => {
+  /**
+   * Send everything outstanding, oldest first, stopping at the first refusal.
+   *
+   * Stopping rather than skipping is deliberate: a failure is almost always the
+   * connection rather than the row, and carrying on would spend the rest of the
+   * queue on the same failure. What did not go stays queued, so the next grade,
+   * the next reconnection or the next tick tries again.
+   */
+  const flushPending = useCallback(async (auditId) => {
     if (!session || !auditId || readOnly) return;
-    const meta = ITEM_INDEX[itemId];
-    if (!meta) return;
+    if (flushingRef.current) return;          // one flush at a time
+    flushingRef.current = true;
+    let failed = false;
     try {
-      const { error } = await supabase.from('audit_items').upsert({
-        audit_id: auditId, item_id: itemId, section_id: meta.sectionId, label: meta.label,
-        shift_id: shiftId, ...patch,
-      }, { onConflict: 'audit_id,item_id,shift_id' });
-      if (error) throw error;
-      setSyncState('synced');
-    } catch (e) { setSyncState('error'); }
+      for (const { itemId, shiftId, patch } of pendingEntries(pendingRef.current)) {
+        const meta = ITEM_INDEX[itemId];
+        if (!meta) { clearWrite(pendingRef.current, itemId, shiftId); continue; }
+        const { error } = await supabase.from('audit_items').upsert({
+          audit_id: auditId, item_id: itemId, section_id: meta.sectionId, label: meta.label,
+          shift_id: shiftId, ...patch,
+        }, { onConflict: 'audit_id,item_id,shift_id' });
+        if (error) { failed = true; break; }
+        // Cleared only once the server has taken it. This is the single point
+        // at which a write stops being outstanding.
+        clearWrite(pendingRef.current, itemId, shiftId);
+      }
+    } catch (e) {
+      failed = true;
+    } finally {
+      flushingRef.current = false;
+      setPendingWrites(queuedCount(pendingRef.current));
+      setSyncState(failed ? 'error' : 'synced');
+    }
+  }, [session, readOnly]);
+
+  /**
+   * Record an item write and try to send it.
+   *
+   * The queue comes first and unconditionally. Whether there is a session, an
+   * audit id or a network, the intent is recorded before anything can fail, so
+   * the header cannot report SYNCED over work that has not been stored.
+   */
+  const pushItem = (auditId, itemId, shiftId, patch) => {
+    if (readOnly) return;
+    if (!ITEM_INDEX[itemId]) return;
+    queueWrite(pendingRef.current, itemId, shiftId, patch);
+    setPendingWrites(queuedCount(pendingRef.current));
+    // No session or no audit row yet: it stays queued and the header says so.
+    // The flush effect picks it up when either arrives.
+    if (!session || !auditId) return;
+    flushPending(auditId);
   };
+
+  // Four things restart a stalled queue: a session arriving or returning after
+  // a refresh, the audit row being created, the device coming back online, and
+  // a slow tick for everything else. None of this makes it offline mode: the
+  // queue lives in memory and covers writes made while the app is open.
+  useEffect(() => {
+    if (!session || !ids.auditId || readOnly) return;
+    if (queuedCount(pendingRef.current) === 0) return;
+    flushPending(ids.auditId);
+  }, [session, ids.auditId, readOnly, flushPending]);
+
+  useEffect(() => {
+    if (!session || !ids.auditId || readOnly) return;
+    const retry = () => { if (queuedCount(pendingRef.current) > 0) flushPending(ids.auditId); };
+    window.addEventListener('online', retry);
+    const timer = setInterval(retry, 20000);
+    return () => { window.removeEventListener('online', retry); clearInterval(timer); };
+  }, [session, ids.auditId, readOnly, flushPending]);
 
   const updateProp = (field, value) => setProp(p => ({ ...p, [field]: value }));
   const updateShiftTime = (shiftId, time) => setProp(p => ({ ...p, shiftTimes: { ...p.shiftTimes, [shiftId]: time } }));
@@ -505,7 +695,7 @@ export default function AHPAudit() {
         from: shiftPrev.status || null, to: status === 'na' && reason ? `na:${reason}` : status,
       });
     }
-    if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status, time, note: shiftPrev.note || null, critical: !!shiftPrev.critical, na_reason: reason, na_note: null });
+    pushItem(ids.auditId, itemId, activeShiftId, { status, time, note: shiftPrev.note || null, critical: !!shiftPrev.critical, na_reason: reason, na_note: null });
   };
 
   // Opens the reason sheet rather than writing N/A directly. Every other status
@@ -518,7 +708,7 @@ export default function AHPAudit() {
     const shiftPrev = prev[activeShiftId] || {};
     const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, note } } };
     setAudit(updated); persist(prop, updated, ids);
-    if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note, time: shiftPrev.time || null, critical: !!shiftPrev.critical, na_reason: shiftPrev.naReason || null, na_note: null });
+    pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note, time: shiftPrev.time || null, critical: !!shiftPrev.critical, na_reason: shiftPrev.naReason || null, na_note: null });
   };
 
   const toggleCritical = (itemId) => {
@@ -527,7 +717,7 @@ export default function AHPAudit() {
     const critical = !shiftPrev.critical;
     const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, critical } } };
     setAudit(updated); persist(prop, updated, ids);
-    if (ids.auditId) pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note: shiftPrev.note || null, time: shiftPrev.time || null, critical, na_reason: shiftPrev.naReason || null, na_note: null });
+    pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note: shiftPrev.note || null, time: shiftPrev.time || null, critical, na_reason: shiftPrev.naReason || null, na_note: null });
   };
 
   // every item ever flagged critical, across all shifts, regardless of current shift selection
@@ -710,6 +900,19 @@ export default function AHPAudit() {
   const needsLegacyAck = !scoringBasis.frozen
     && isUnfrozenStatus(snapshotStatus)
     && snapshotStatus !== SNAPSHOT_STATUS.NONE;
+
+  // What the header says about syncing is derived from what is actually true,
+  // not set by whichever code path ran last. That is the whole fix: SYNCED is
+  // only ever the answer when there is a session and the queue is empty, so a
+  // later success cannot paper over an earlier failure and an expired session
+  // cannot keep showing the last good write.
+  const effectiveSync = resolveSyncState({
+    hasSession: !!session,
+    pending: pendingWrites,
+    lastError: syncState === 'error',
+  });
+  const syncBadge = syncLabel(effectiveSync, pendingWrites);
+  const SYNC_TONE = { ok: '#4DC87A', busy: C.gold, bad: '#E05555', muted: C.muted };
 
   // Write the frozen basis onto the audit row, once.
   //
@@ -1164,6 +1367,15 @@ export default function AHPAudit() {
               <button onClick={() => setScreen('login')} style={{ background: 'none', border: 'none', color: C.muted, fontSize: '12px', cursor: 'pointer' }}>Sign in to sync this audit across devices</button>
             </div>
           )}
+          {/* The way back into an audit whose ids this device no longer has.
+              A cleared browser used to make a part finished audit unreachable
+              from the console, and this is the screen a recovering auditor
+              lands on, so the door belongs here. */}
+          {session && isInternal && (
+            <div style={{ textAlign: 'center', marginTop: '14px' }}>
+              <button onClick={() => setScreen('review')} style={{ background: 'none', border: 'none', color: C.gold, fontSize: '13px', fontWeight: '600', cursor: 'pointer', padding: '8px' }}>Resume an existing audit</button>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1181,10 +1393,15 @@ export default function AHPAudit() {
                 {session.user.email}
               </span>
             )}
+            {/* A reviewer lives on this screen. An auditor arrived from an
+                audit and needs the way back. */}
+            {isInternal && (
+              <button onClick={() => setScreen(prop.name ? 'home' : 'setup')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Back</button>
+            )}
             <button onClick={signOut} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: '12px', padding: 0 }}>Sign out</button>
           </div>
         </div>
-        <ReviewBar />
+        {isReviewer && <ReviewBar />}
         <div style={bodyStyle}>
           {accessExpired ? (
             <div style={{ padding: '48px 0', textAlign: 'center' }}>
@@ -1194,17 +1411,27 @@ export default function AHPAudit() {
           ) : (
             <>
               <div style={{ marginBottom: '20px' }}>
-                <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>AUDIT REVIEW</div>
+                <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>{isReviewer ? 'AUDIT REVIEW' : 'RESUME AN AUDIT'}</div>
                 <h1 style={{ fontSize: '19px', fontWeight: '700', margin: '0 0 3px' }}>All audits</h1>
                 <div style={{ fontSize: '12px', color: C.dim }}>
                   {browseLoading ? 'Loading…' : `${auditsList.length} audit${auditsList.length === 1 ? '' : 's'}`}
+                  {!isReviewer && !browseLoading && auditsList.length > 0 && ' · opening one replaces what is on this device'}
                 </div>
               </div>
 
               {openError && (
                 <div style={{ marginBottom: '12px', padding: '12px 14px', borderRadius: '8px', background: C.warnBg, border: '1px solid rgba(245,166,35,0.25)' }}>
-                  <div style={{ fontSize: '13px', fontWeight: '600', color: C.warn, marginBottom: '3px' }}>That audit could not be opened.</div>
-                  <div style={{ fontSize: '12px', color: C.dim, lineHeight: '1.5' }}>Please try again. If it keeps happening, contact Specula.</div>
+                  {openError === 'pending' ? (
+                    <>
+                      <div style={{ fontSize: '13px', fontWeight: '600', color: C.warn, marginBottom: '3px' }}>The audit on this device has unsaved changes.</div>
+                      <div style={{ fontSize: '12px', color: C.dim, lineHeight: '1.5' }}>Opening another audit would replace it. Go back, wait for the header to read SYNCED, then try again.</div>
+                    </>
+                  ) : (
+                    <>
+                      <div style={{ fontSize: '13px', fontWeight: '600', color: C.warn, marginBottom: '3px' }}>That audit could not be opened.</div>
+                      <div style={{ fontSize: '12px', color: C.dim, lineHeight: '1.5' }}>Please try again. If it keeps happening, contact Specula.</div>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -1227,7 +1454,7 @@ export default function AHPAudit() {
                 const place = [p.city, p.country].filter(Boolean).join(', ');
                 const published = a.status === 'published';
                 return (
-                  <div key={a.id} onClick={() => openAuditForReview(a)}
+                  <div key={a.id} onClick={() => (isReviewer ? openAuditForReview(a) : resumeAudit(a))}
                     style={card({ display: 'flex', alignItems: 'center', gap: '14px', cursor: 'pointer' })}>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', flexWrap: 'wrap' }}>
@@ -1270,19 +1497,31 @@ export default function AHPAudit() {
                 {session.user.email}
               </span>
             )}
-            <span style={{ fontSize: '10px', fontWeight: '600', letterSpacing: '0.06em', color: !session ? C.muted : syncState === 'synced' ? '#4DC87A' : syncState === 'error' ? C.warn : C.muted }}>
-              {!session ? 'OFFLINE' : syncState === 'synced' ? 'SYNCED' : syncState === 'error' ? 'SYNC ERROR' : 'LOCAL'}
+            <span style={{ fontSize: '11px', fontWeight: '700', letterSpacing: '0.06em', color: SYNC_TONE[syncBadge.tone] || C.muted }}>
+              {syncBadge.text}
             </span>
             {readOnly ? (
               <button onClick={closeReviewAudit} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>All audits</button>
             ) : (
               <button onClick={() => setScreen('setup')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Edit</button>
             )}
-            {session && (
+            {session ? (
               <button onClick={signOut} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: '12px', padding: 0 }}>Sign out</button>
+            ) : (
+              // A session that expired mid audit leaves the grades on screen and
+              // in the queue. This is the way back to sending them, and it has
+              // to be reachable from where the auditor already is.
+              <button onClick={() => setScreen('login')} style={{ background: 'none', border: 'none', color: C.gold, cursor: 'pointer', fontSize: '12px', fontWeight: '700', padding: 0 }}>Sign in</button>
             )}
           </div>
         </div>
+        {!session && !readOnly && (
+          <div style={{ padding: '8px 16px', background: 'rgba(224,85,85,0.10)', borderBottom: '1px solid rgba(224,85,85,0.3)', fontSize: '12px', color: '#E05555', lineHeight: '1.45' }}>
+            {pendingWrites > 0
+              ? `You are signed out. ${pendingWrites} change${pendingWrites === 1 ? '' : 's'} on this device ${pendingWrites === 1 ? 'has' : 'have'} not been saved to Specula. Sign in to send ${pendingWrites === 1 ? 'it' : 'them'}.`
+              : 'You are signed out. Nothing is being saved to Specula. Sign in to continue.'}
+          </div>
+        )}
         {readOnly && <ReviewBar />}
         <ShiftBar />
         <div style={bodyStyle}>
