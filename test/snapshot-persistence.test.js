@@ -390,3 +390,106 @@ test('back-write: the row patch is the same six columns as a first freeze', () =
   assert.equal(snapshotToRow(basis).snapshot_locked_at, LOCKED_AT,
     'the original lock date, not the moment of the back-write');
 });
+
+// ── a missing audit row must not abort the pull ─────────────────────────────
+//
+// The pull asked for the audit row with `.single()`, which promises exactly one
+// row. PostgREST answers 406 when there is none, supabase-js turns that into an
+// error, and the throw took the whole pull with it: no item merge, no
+// rowSnapshotRef, and a console that carried on from stale local state with a
+// sync indicator as the only clue.
+//
+// It is not hypothetical. During the Phase 5.7 investigation a browser held an
+// audit id for a row deleted during an earlier cleanup, and every pull returned
+// 406. `.maybeSingle()` returns null instead, which the rest of the code
+// already handles: a missing row simply carries no basis.
+
+/** The pull's outcome, computed the way the effect computes it. */
+function pullOutcome({ auditRow, items = [], localSnapshot = null }) {
+  const rowSnapshot = snapshotFromRow(auditRow);
+  const picked = pickSnapshot(rowSnapshot, localSnapshot);
+  return {
+    rowSnapshot,
+    basis: picked.snapshot,
+    source: picked.source,
+    itemsMerged: items.length > 0,
+    mergedCount: items.length,
+    // A row that is not there is not synced, whatever else succeeded.
+    syncState: auditRow ? 'synced' : 'error',
+  };
+}
+
+const MISSING_ROW = null;                       // what maybeSingle returns
+const EMPTY_ROW = { tier: 'full', property_category: null, facility_profile: null,
+  scope_sections: null, framework_version: null, checklist_version: null,
+  snapshot_locked_at: null };
+const REMOTE_ITEMS = [
+  { item_id: 'RM-01', shift_id: 'day', status: 'met', na_reason: null },
+  { item_id: 'RM-10', shift_id: 'day', status: 'na', na_reason: 'not_present' },
+];
+
+test('a missing audit row leaves the local basis intact', () => {
+  const local = frozen();
+  const out = pullOutcome({ auditRow: MISSING_ROW, items: REMOTE_ITEMS, localSnapshot: local });
+
+  assert.equal(out.rowSnapshot, null, 'nothing is read from a row that is not there');
+  assert.deepEqual(out.basis, local, 'the local cache still carries the audit');
+  assert.equal(out.source, 'local-cache');
+});
+
+test('a missing audit row does not stop the item merge', () => {
+  // The actual regression: the throw aborted everything after it.
+  const out = pullOutcome({ auditRow: MISSING_ROW, items: REMOTE_ITEMS, localSnapshot: frozen() });
+  assert.equal(out.itemsMerged, true);
+  assert.equal(out.mergedCount, 2);
+});
+
+test('a missing audit row is reported as not synced', () => {
+  // Continuing past the missing row must not turn into a false reassurance.
+  assert.equal(pullOutcome({ auditRow: MISSING_ROW, items: REMOTE_ITEMS, localSnapshot: frozen() }).syncState, 'error');
+  assert.equal(pullOutcome({ auditRow: EMPTY_ROW, items: REMOTE_ITEMS, localSnapshot: frozen() }).syncState, 'synced');
+});
+
+test('a missing audit row never invents a basis for an audit that had none', () => {
+  const out = pullOutcome({ auditRow: MISSING_ROW, items: REMOTE_ITEMS, localSnapshot: null });
+  assert.equal(out.basis, null);
+  assert.equal(out.source, 'none');
+  assert.equal(classifyLoadedAudit(out.basis, GRADES), SNAPSHOT_STATUS.LEGACY_UNFROZEN);
+  assert.equal(shouldPersistSnapshot(out.basis, out.rowSnapshot), false, 'and nothing is written');
+});
+
+test('a present row still outranks the local cache, unchanged', () => {
+  const rowBasis = buildSnapshot({ ...PROP, category: '5★' }, FULL);
+  const localBasis = buildSnapshot({ ...PROP, category: '4★' }, { ...FULL, lockedAt: '2026-01-01T00:00:00.000Z' });
+  const out = pullOutcome({ auditRow: asRow(rowBasis), items: REMOTE_ITEMS, localSnapshot: localBasis });
+
+  assert.equal(out.source, 'audit-row');
+  assert.equal(out.basis.propertyCategory, '5★');
+  assert.equal(out.syncState, 'synced');
+});
+
+test('a present row with no basis still falls back to the local cache', () => {
+  const local = frozen();
+  const out = pullOutcome({ auditRow: EMPTY_ROW, items: REMOTE_ITEMS, localSnapshot: local });
+
+  assert.equal(out.rowSnapshot, null);
+  assert.equal(out.source, 'local-cache');
+  assert.deepEqual(out.basis, local);
+  assert.equal(out.syncState, 'synced', 'the row exists, so the audit is synced');
+  // And this is the case that back-writes, which a 406 used to prevent
+  // by never letting rowSnapshotRef be set at all.
+  assert.equal(shouldPersistSnapshot(out.basis, out.rowSnapshot), true);
+});
+
+test('the missing-row path is what the 406 produced, and it now recovers', () => {
+  // Before: 406 -> throw -> no merge, no basis read, no back-write, sync error.
+  // After:  null row -> merge runs, local basis kept, sync honestly reports
+  //         error because the audit really is not there.
+  const local = frozen();
+  const out = pullOutcome({ auditRow: MISSING_ROW, items: REMOTE_ITEMS, localSnapshot: local });
+
+  assert.deepEqual(
+    { merged: out.itemsMerged, basisKept: !!out.basis, source: out.source, sync: out.syncState },
+    { merged: true, basisKept: true, source: 'local-cache', sync: 'error' },
+  );
+});

@@ -375,10 +375,17 @@ export default function AHPAudit() {
         // storage. Local storage is a cache that lets an offline auditor keep
         // working; the row is what an audit actually was scored against, and it
         // is the only copy that survives a lost browser profile.
+        // maybeSingle, not single. `.single()` promises exactly one row, so
+        // PostgREST answers 406 Not Acceptable when the audit is not there and
+        // supabase-js turns that into an error. Thrown here it aborted the
+        // whole pull: the item merge never ran, rowSnapshotRef was never set,
+        // and the console carried on from stale local state with only a sync
+        // indicator to show for it. A missing audit is a fact to handle, not a
+        // transport failure.
         const { data: auditRow, error: aErr } = await supabase
           .from('audits')
           .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at')
-          .eq('id', ids.auditId).single();
+          .eq('id', ids.auditId).maybeSingle();
         if (aErr) throw aErr;
 
         const { data: items, error } = await supabase
@@ -407,7 +414,10 @@ export default function AHPAudit() {
           // a second session cannot start a fresh one alongside it.
           adoptAudit(audit, picked.snapshot);
         }
-        setSyncState('synced');
+        // An audit that is not in the database is not synced, whatever else
+        // succeeded. Saying otherwise would tell an auditor their work is
+        // stored when there is nothing on the other end to store it in.
+        setSyncState(auditRow ? 'synced' : 'error');
       } catch (e) { setSyncState('error'); }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
