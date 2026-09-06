@@ -1056,7 +1056,7 @@ export default function AHPAudit() {
   const appStyle = { minHeight: '100vh', background: C.bg, color: C.text, fontFamily: '-apple-system, BlinkMacSystemFont, "Inter", sans-serif', fontSize: '15px' };
   const headerStyle = { background: C.surface, borderBottom: `1px solid ${C.border}`, padding: '0 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: '54px', position: 'sticky', top: 0, zIndex: 100 };
   const logoStyle = { fontSize: '12px', fontWeight: '700', letterSpacing: '0.18em', color: C.gold };
-  const bodyStyle = { maxWidth: '600px', margin: '0 auto', padding: '24px 16px 48px' };
+  const bodyStyle = { maxWidth: '600px', margin: '0 auto', padding: '24px 16px calc(140px + env(safe-area-inset-bottom, 0px))' };
   const card = (extra = {}) => ({ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '12px', padding: '18px 20px', marginBottom: '10px', ...extra });
   const lbl = { fontSize: '11px', fontWeight: '600', letterSpacing: '0.1em', textTransform: 'uppercase', color: C.muted, marginBottom: '8px', display: 'block' };
   const inp = { width: '100%', background: C.surface2, border: `1px solid ${C.border}`, borderRadius: '8px', padding: '11px 14px', color: C.text, fontSize: '15px', outline: 'none', boxSizing: 'border-box' };
