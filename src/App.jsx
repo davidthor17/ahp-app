@@ -21,6 +21,15 @@ import {
   SYNC, createQueue, queueWrite, clearWrite, pendingCount as queuedCount,
   pendingEntries, resolveSyncState, syncLabel, applyPending,
 } from "./framework/syncQueue.js";
+import {
+  UPDATE_STATE, updateBannerState, updateBannerText, buildAgeDays,
+  shouldShowUpdateBanner,
+} from "./framework/appUpdate.js";
+import { initServiceWorkerUpdates } from "./swUpdate.js";
+
+// Stamped at build time by vite.config.js. Undefined under node --test, where
+// nothing reads it.
+const BUILD_TIME = typeof __BUILD_TIME__ === 'string' ? __BUILD_TIME__ : null;
 
 // Settings → API in your Supabase project → Project URL + anon public key.
 // Safe to expose in client code — access is governed by the RLS policies
@@ -139,6 +148,9 @@ export default function AHPAudit() {
   const pendingRef                        = useRef(createQueue());
   const [pendingWrites, setPendingWrites] = useState(0);
   const flushingRef                       = useRef(false);
+  // A new build is downloaded and waiting. Never acted on automatically.
+  const [needRefresh, setNeedRefresh]     = useState(false);
+  const applyUpdateRef                    = useRef(null);
   const [ids, setIds]                     = useState({ propertyId: null, auditId: null, auditRef: null });
   const [prop, setProp]                   = useState({
     name: '', city: '', country: '', chain: false, chainName: '',
@@ -215,6 +227,12 @@ export default function AHPAudit() {
   // acknowledgement. A frozen audit never sees it.
   const [legacyAck, setLegacyAck]         = useState(false);
   useEffect(() => { auditTierRef.current = auditTier; }, [auditTier]);
+
+  // Watch for new builds. This only ever sets a flag: nothing here reloads the
+  // app, and the reload the banner offers is refused while writes are unsaved.
+  useEffect(() => {
+    applyUpdateRef.current = initServiceWorkerUpdates(() => setNeedRefresh(true));
+  }, []);
 
   // ---------- reviewer (read-only external access) ----------
   // profile is the caller's own auditors row. The database is the security
@@ -832,12 +850,20 @@ export default function AHPAudit() {
   // item, which is what isApplicable expects; the raw SECTIONS item does not
   // know its own section.
   const itemIndex = useMemo(() => catalogIndex(), []);
+  // The checklist this audit froze, as a Set, or null when its basis predates
+  // the pin. Asked once per item per render, so it is not rebuilt each time.
+  const checklistPin = useMemo(
+    () => (scoringBasis.checklistItems ? new Set(scoringBasis.checklistItems) : null),
+    [scoringBasis.checklistItems],
+  );
   const isItemApplicable = useCallback(
     (itemId) => {
       const item = itemIndex.get(itemId);
-      return item ? isApplicable(item, captureProfile, scoringBasis.scopeSections) : false;
+      // The pin, where the basis carries one, is what stops an audit already
+      // under way from gaining items added to the catalogue after it started.
+      return item ? isApplicable(item, captureProfile, scoringBasis.scopeSections, checklistPin) : false;
     },
-    [itemIndex, captureProfile, scoringBasis.scopeSections],
+    [itemIndex, captureProfile, scoringBasis.scopeSections, checklistPin],
   );
 
   const visibleSections = SECTIONS.filter(s => !s.facility || captureProfile[s.facility]);
@@ -878,7 +904,12 @@ export default function AHPAudit() {
   // basis is resolved once, above, and shared with the capture screen so the
   // two can never disagree about which items belong to this audit.
   const frameworkResult = useMemo(
-    () => frameworkScore(audit, scoringBasis.profile, { scopeSections: scoringBasis.scopeSections }),
+    () => frameworkScore(audit, scoringBasis.profile, {
+      scopeSections: scoringBasis.scopeSections,
+      // Capture and scoring have to be asked the same question. Handing the pin
+      // to one and not the other would be the Phase 5.2 defect in a new place.
+      checklistItems: scoringBasis.checklistItems,
+    }),
     [audit, scoringBasis],
   );
 
@@ -913,6 +944,47 @@ export default function AHPAudit() {
   });
   const syncBadge = syncLabel(effectiveSync, pendingWrites);
   const SYNC_TONE = { ok: '#4DC87A', busy: C.gold, bad: '#E05555', muted: C.muted };
+
+  // ---------- app updates ----------
+  const updateState = updateBannerState({
+    needRefresh, pendingWrites, buildTime: BUILD_TIME,
+  });
+
+  /**
+   * The banner, shown above every working screen.
+   *
+   * Three states and one rule: the reload button exists only when there is
+   * nothing left to save. BLOCKED deliberately offers no way through, because
+   * the queue is in memory and reloading past it loses grades the auditor has
+   * already made. It clears itself as soon as the flush drains.
+   */
+  const UpdateBar = () => {
+    if (!shouldShowUpdateBanner(updateState)) return null;
+    const stale = updateState === UPDATE_STATE.STALE;
+    const ready = updateState === UPDATE_STATE.AVAILABLE;
+    const text = updateBannerText(updateState, {
+      pendingWrites, ageDays: buildAgeDays({ buildTime: BUILD_TIME }),
+    });
+    return (
+      <div style={{
+        padding: '9px 16px', display: 'flex', alignItems: 'center', gap: '12px',
+        background: stale ? C.warnBg : 'rgba(201,170,113,0.12)',
+        borderBottom: `1px solid ${stale ? 'rgba(245,166,35,0.3)' : C.goldBorder}`,
+        fontSize: '12px', color: stale ? C.warn : C.gold, lineHeight: '1.45',
+      }}>
+        <span style={{ flex: 1, minWidth: 0 }}>{text}</span>
+        {ready && (
+          <button
+            onClick={() => { if (applyUpdateRef.current) applyUpdateRef.current(); }}
+            style={{
+              flexShrink: 0, background: C.gold, border: 'none', borderRadius: '7px',
+              padding: '7px 12px', color: '#0C0C0F', fontSize: '12px', fontWeight: '700',
+              letterSpacing: '0.04em', cursor: 'pointer',
+            }}>UPDATE</button>
+        )}
+      </div>
+    );
+  };
 
   // Write the frozen basis onto the audit row, once.
   //
@@ -1401,6 +1473,7 @@ export default function AHPAudit() {
             <button onClick={signOut} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: '12px', padding: 0 }}>Sign out</button>
           </div>
         </div>
+        <UpdateBar />
         {isReviewer && <ReviewBar />}
         <div style={bodyStyle}>
           {accessExpired ? (
@@ -1522,6 +1595,7 @@ export default function AHPAudit() {
               : 'You are signed out. Nothing is being saved to Specula. Sign in to continue.'}
           </div>
         )}
+        <UpdateBar />
         {readOnly && <ReviewBar />}
         <ShiftBar />
         <div style={bodyStyle}>
@@ -1601,6 +1675,7 @@ export default function AHPAudit() {
           <span style={logoStyle}>A · H · P</span>
           <button onClick={() => setScreen('home')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Back</button>
         </div>
+        <UpdateBar />
         {readOnly && <ReviewBar />}
         <div style={bodyStyle}>
           <div style={{ marginBottom: '24px' }}>
@@ -1632,6 +1707,9 @@ export default function AHPAudit() {
           <span style={logoStyle}>A · H · P</span>
           <button onClick={() => setScreen('home')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Back</button>
         </div>
+        {/* Publishing from a stale bundle is the worst version of this problem,
+            so the warning belongs here as much as anywhere. */}
+        <UpdateBar />
         <div style={bodyStyle}>
           <div style={{ marginBottom: '24px' }}>
             <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>FINISH & PUBLISH</div>
@@ -1781,6 +1859,7 @@ export default function AHPAudit() {
           <span style={logoStyle}>A · H · P</span>
           <div style={{ width: '32px' }} />
         </div>
+        <UpdateBar />
         {readOnly && <ReviewBar />}
         <ShiftBar />
         <div style={bodyStyle}>

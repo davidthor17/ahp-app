@@ -1,0 +1,122 @@
+-- Phase 5.8 P0-B: pin an audit's checklist to the items it actually covers
+--
+-- NOT APPLIED. Prepared for review.
+--
+-- Project: zbmhfdoqmzzscdklziss
+-- Affected: public.audits (7 rows, all left null). No other table.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT THIS FIXES
+--
+-- The snapshot froze the conditions an audit was scored against: the category,
+-- the facility profile, the audit type and the scope sections. It did not
+-- freeze which items existed. isItemApplicable and applicableItems both walk
+-- catalogIndex(), which defaults to today's SECTIONS, so the set of applicable
+-- items was always read from the catalogue as it stands now.
+--
+-- checklist_version was recorded on the row and in the snapshot, but nothing
+-- ever read it to select a catalogue. It was a label, not a mechanism.
+--
+-- So an audit's scope grew whenever src/auditItems.js grew, frozen basis or
+-- not. AHP-2026-D699 showed 71 of 71 on the bundle it was captured with and
+-- 71 of 107 today, because 36 items were added to the catalogue on 9 and 28
+-- August. The audit did not change. The denominator did.
+--
+-- This column records the item ids that were applicable at the moment the
+-- basis froze, so an audit already under way keeps the checklist it started
+-- with and the catalogue can grow without touching it.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+
+begin;
+
+-- Nullable, no default, no backfill. Null means "not pinned", which is the
+-- truth for all seven existing audits and is exactly how they behave today:
+-- applicability continues to be read from the live catalogue for them.
+--
+-- A default of '[]'::jsonb would be actively wrong. An empty array is a real
+-- statement that no item applies, and would empty every historical audit.
+alter table public.audits
+  add column if not exists checklist_items jsonb;
+
+comment on column public.audits.checklist_items is
+  'Item ids applicable when this audit''s basis froze, as a JSON array of strings. Null means the basis predates the pin and applicability is read from the live catalogue. Never write an empty array: that asserts no item applies.';
+
+commit;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- HOW EXISTING ROWS BEHAVE
+--
+--   audits           one new column, all seven null
+--   audit_items      unchanged, no column touched
+--   properties       unchanged, no column touched
+--   published report unchanged, published_result is already a frozen payload
+--                    and is not recomputed from the catalogue
+--
+-- A null pin resolves to the current behaviour in every path: snapshotFromRow
+-- returns checklistItems null, resolveScoringProfile passes null through, and
+-- isApplicable ignores a null pin. No historical score can move.
+--
+-- AHP-2026-8B10, the one published audit, is legacy-unfrozen and stays so.
+-- Its published_result is null and nothing here creates one.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NO BACKFILL
+--
+-- Deliberately absent, for the third time in this series and for the same
+-- reason. Writing today's applicable set into a historical audit would state,
+-- as recorded fact, a scope nobody recorded. Writing the set of items that
+-- happen to be graded would be closer to the truth but is still an inference,
+-- and it belongs to a decision about one specific audit rather than to a
+-- migration that runs over all of them.
+--
+-- AHP-2026-D699 (HG Jardin Menorca) is the audit this would tempt somebody to
+-- fix. It has 71 graded item ids and no basis. Pinning exactly those 71 is a
+-- defensible recovery because every one of them is recorded rather than
+-- inferred, but it is an explicit, single-row, evidence-logged decision and it
+-- is not this migration's to take. Leave it alone.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ROLLOUT ORDER
+--
+-- This migration must be applied BEFORE the code that writes the column.
+-- snapshotToRow includes checklist_items once deployed, and an update naming a
+-- column that does not exist fails with 42703, which would take the whole
+-- basis write down with it. Same ordering as Phase 5.6.2.
+--
+--   1. apply this migration
+--   2. verify the column exists and every row is null
+--   3. deploy the code
+--
+-- The reverse order leaves basis persistence broken for every audit started in
+-- between.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- VERIFICATION
+--
+--   select count(*) as audits,
+--          count(checklist_items) as pinned
+--     from public.audits;
+--   -- expect: audits 7, pinned 0
+--
+--   select column_name, data_type, is_nullable, column_default
+--     from information_schema.columns
+--    where table_schema = 'public'
+--      and table_name = 'audits'
+--      and column_name = 'checklist_items';
+--   -- expect: jsonb, YES, null
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ROLLBACK
+--
+--   begin;
+--   alter table public.audits drop column if exists checklist_items;
+--   commit;
+--
+-- Safe while no audit has been pinned. Once audits have been carried out under
+-- a pin, dropping it returns them to reading the live catalogue, which is the
+-- drift this column exists to prevent. Capture them first:
+--
+--   select ref, checklist_items
+--     from public.audits
+--    where checklist_items is not null;

@@ -15,6 +15,7 @@
 
 import { FRAMEWORK_VERSION, CHECKLIST_VERSION } from './version.js';
 import { AUDIT_TYPE, DEFAULT_AUDIT_TYPE, STAR_RANK } from './weights.js';
+import { applicableItems } from './catalog.js';
 
 // Flags that gate a whole section. Present since the first snapshot, so a
 // snapshot is only usable if it carries all three.
@@ -49,14 +50,25 @@ export function buildSnapshot(prop = {}, context = {}) {
   // and quietly drop five fundamentals out of the audit at snapshot time.
   for (const flag of DEPENDENCY_FLAGS) facilityProfile[flag] = prop[flag] !== false;
 
+  const auditType = context.auditType || DEFAULT_AUDIT_TYPE;
+  const scopeSections = normaliseScope(context.scopeSections, context.auditType);
+  const profile = { category: prop.category || null, ...facilityProfile };
+
   return {
     propertyCategory: prop.category || null,
     facilityProfile,
-    auditType: context.auditType || DEFAULT_AUDIT_TYPE,
+    auditType,
     // null means the whole catalogue. Only a Spot Audit narrows it.
-    scopeSections: normaliseScope(context.scopeSections, context.auditType),
+    scopeSections,
     frameworkVersion: FRAMEWORK_VERSION,
     checklistVersion: CHECKLIST_VERSION,
+    // The items this audit covers, settled now and never widened again.
+    //
+    // Phase 5.8 P0-B. Everything above describes the property; none of it
+    // describes the checklist, so the applicable set was recomputed from the
+    // live catalogue on every render and grew whenever the catalogue grew.
+    // Recording the ids is what makes "the audit I started" a fixed thing.
+    checklistItems: applicableItems(profile, { scopeSections }).map((i) => i.id),
     lockedAt: context.lockedAt || null,
   };
 }
@@ -65,6 +77,18 @@ function normaliseScope(scopeSections, auditType) {
   if (!Array.isArray(scopeSections) || scopeSections.length === 0) return null;
   if (auditType && auditType !== AUDIT_TYPE.SPOT) return null;
   return [...new Set(scopeSections)];
+}
+
+/**
+ * A checklist pin, or null.
+ *
+ * Empty is null on purpose, in both directions. An empty array asserts that no
+ * item applies, which would empty an audit rather than pin it, so it must never
+ * survive a write to the row or a read back out of one.
+ */
+function normalisePin(checklistItems) {
+  if (!Array.isArray(checklistItems) || checklistItems.length === 0) return null;
+  return [...new Set(checklistItems.filter((id) => typeof id === 'string' && id))];
 }
 
 /**
@@ -164,6 +188,10 @@ export function resolveScoringProfile(snapshot, liveProp = {}, status = null) {
       profile: { category: snapshot.propertyCategory, ...withDependencyDefaults(snapshot.facilityProfile) },
       auditType: snapshot.auditType || DEFAULT_AUDIT_TYPE,
       scopeSections: snapshot.scopeSections || null,
+      // The pin, when this basis carries one. Null for a basis frozen before
+      // the pin existed, which keeps those audits reading the live catalogue
+      // exactly as they do today.
+      checklistItems: normalisePin(snapshot.checklistItems),
       source: 'snapshot',
       status: SNAPSHOT_STATUS.FROZEN,
       frozen: true,
@@ -186,6 +214,10 @@ export function resolveScoringProfile(snapshot, liveProp = {}, status = null) {
     profile,
     auditType: DEFAULT_AUDIT_TYPE,
     scopeSections: null,
+    // No basis, so no pin. An audit with no recorded checklist reads the live
+    // catalogue, which is the behaviour every existing audit has today and the
+    // one this branch must not change.
+    checklistItems: null,
     // Named so a reviewer can tell a reconstructed basis from a recorded one.
     source: 'live-property-fallback',
     // A frozen status can never be reported here: this branch only runs when
@@ -288,10 +320,13 @@ export function isFavourableScopeChange(snapshot, nextScope) {
 // A row that already holds a basis is never replaced from local state: one
 // client writes it once, and a stale cache must not be able to overwrite it.
 
-/** The six audits columns a frozen snapshot occupies. */
+/** The seven audits columns a frozen snapshot occupies. */
 export const SNAPSHOT_COLUMNS = Object.freeze([
   'property_category', 'facility_profile', 'scope_sections',
   'framework_version', 'checklist_version', 'snapshot_locked_at',
+  // Added by migrations/2026-09-09-phase58-checklist-pin.sql, which must be
+  // applied before this column is written or the update fails with 42703.
+  'checklist_items',
 ]);
 
 /**
@@ -307,6 +342,9 @@ export function snapshotToRow(snapshot) {
     scope_sections: snapshot.scopeSections || null,
     framework_version: snapshot.frameworkVersion || null,
     checklist_version: snapshot.checklistVersion || null,
+    // Only ever a non-empty array or null. An empty array would assert that no
+    // item applies, which would empty the audit rather than pin it.
+    checklist_items: normalisePin(snapshot.checklistItems),
     snapshot_locked_at: snapshot.lockedAt || null,
   };
 }
@@ -328,6 +366,9 @@ export function snapshotFromRow(row) {
     scopeSections: row.scope_sections || null,
     frameworkVersion: row.framework_version || null,
     checklistVersion: row.checklist_version || null,
+    // Null for every audit whose basis froze before the pin existed, which is
+    // what keeps them reading applicability from the live catalogue.
+    checklistItems: normalisePin(row.checklist_items),
     lockedAt: row.snapshot_locked_at,
   };
   return isUsableSnapshot(snapshot) ? snapshot : null;

@@ -70,10 +70,15 @@ test('a three-state flag keeps all three states through the row', () => {
   assert.equal(p.hasLunchService, true);
 });
 
-test('snapshotToRow writes exactly the six columns and nothing else', () => {
+test('snapshotToRow writes exactly the seven columns and nothing else', () => {
+  // Seven since Phase 5.8 P0-B added checklist_items. The count is asserted so
+  // a column cannot join the basis without the migration that receives it: an
+  // update naming a column the database does not have fails with 42703 and
+  // takes the whole basis write down with it.
   const row = snapshotToRow(frozen());
   assert.deepEqual(Object.keys(row).sort(), [...SNAPSHOT_COLUMNS].sort());
-  assert.equal(SNAPSHOT_COLUMNS.length, 6);
+  assert.equal(SNAPSHOT_COLUMNS.length, 7);
+  assert.ok(SNAPSHOT_COLUMNS.includes('checklist_items'), 'the pin has a column');
 });
 
 test('a Spot scope travels with the basis', () => {

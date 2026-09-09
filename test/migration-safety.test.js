@@ -112,3 +112,33 @@ test('the Phase 4B DDL still adds exactly the eight columns it is meant to', () 
   assert.ok(sql.includes('audit_items_na_reason_check'), 'the na_reason constraint is missing');
   assert.ok(sql.includes('reviewer reads activity log'), 'the reviewer policy is missing');
 });
+
+// ── Phase 5.8 P0-B: the checklist pin column ────────────────────────────────
+
+test('the checklist pin migration exists and adds exactly one nullable column', () => {
+  const file = '2026-09-09-phase58-checklist-pin.sql';
+  assert.ok(files.includes(file), `${file} is missing`);
+
+  const sql = statements(read(file));
+  assert.match(sql, /add column if not exists\s+checklist_items\s+jsonb/i);
+  assert.equal((sql.match(/add column/gi) || []).length, 1, 'exactly one column');
+  // The rules the other migrations are held to are asserted for all files
+  // above. These are the two that would specifically ruin this one.
+  assert.equal(/default/i.test(sql), false, 'a default would empty every audit');
+  assert.equal(/not null/i.test(sql), false);
+});
+
+test('the pin migration records why an empty array must never be a default', () => {
+  // The trap is specific to this column: '[]' is a real statement that no item
+  // applies, so a well-meaning default would empty all seven existing audits.
+  const raw = read('2026-09-09-phase58-checklist-pin.sql');
+  assert.match(raw, /empty array/i, 'the file should say why the default is absent');
+  assert.match(raw, /AHP-2026-D699/, 'and name the audit nobody should quietly fix');
+});
+
+test('the pin migration states the rollout order it depends on', () => {
+  // Deploying the code first breaks every basis write with 42703.
+  const raw = read('2026-09-09-phase58-checklist-pin.sql');
+  assert.match(raw, /42703/, 'the file should name the failure the wrong order causes');
+  assert.match(raw, /apply this migration/i);
+});

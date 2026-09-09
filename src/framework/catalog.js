@@ -74,7 +74,8 @@ export function rankOf(profile = {}) {
  * A missing flag is treated as present. That is deliberate: it keeps every
  * audit recorded before these flags existed scoring exactly as it did.
  */
-export function isApplicable(item, profile = {}, scopeSections = null) {
+export function isApplicable(item, profile = {}, scopeSections = null, checklistItems = null) {
+  if (!inChecklist(item.id, checklistItems)) return false;
   if (item.facility && !profile[item.facility]) return false;
   if (item.requires && profile[item.requires] === false) return false;
   if (item.minStars > rankOf(profile)) return false;
@@ -82,8 +83,43 @@ export function isApplicable(item, profile = {}, scopeSections = null) {
   return true;
 }
 
+/**
+ * The fifth gate, and the only one that looks backwards rather than at the
+ * property: was this item on the checklist when the audit's basis froze?
+ *
+ * Phase 5.8 P0-B. The other four gates are evaluated against today's
+ * catalogue, so an audit's scope grew every time src/auditItems.js grew. The
+ * frozen basis did not stop it: it pins the category, the facility profile,
+ * the audit type and the scope sections, but never which items exist.
+ * checklist_version was recorded on the row and never read by anything.
+ * AHP-2026-D699 showed 71 of 71 when it was captured and 71 of 107 today,
+ * having not itself changed at all.
+ *
+ * A null pin means the basis predates this, and applicability is read live.
+ * That is what every existing audit does and must keep doing. Accepts an
+ * array, which is how it comes back from JSONB, or a Set, which is what a
+ * render loop should hand it.
+ */
+export function inChecklist(itemId, checklistItems = null) {
+  if (!checklistItems) return true;
+  // An empty pin is no pin. It has to be said here as well as in normalisePin,
+  // because an empty array is truthy: without this line a pin that arrived
+  // empty, from a hand-edited row or a bad write, would silently report that
+  // no item applies and empty the audit rather than fail loudly. The safe
+  // reading of "I have no list" is always the unpinned one.
+  const size = typeof checklistItems.size === 'number' ? checklistItems.size : checklistItems.length;
+  if (!size) return true;
+  return typeof checklistItems.has === 'function'
+    ? checklistItems.has(itemId)
+    : checklistItems.includes(itemId);
+}
+
 /** Items in scope for a property, in catalogue order. */
 export function applicableItems(profile = {}, options = {}) {
-  const { sections = CATALOG_SECTIONS, scopeSections = null } = options;
-  return catalogItems(sections).filter((item) => isApplicable(item, profile, scopeSections));
+  const { sections = CATALOG_SECTIONS, scopeSections = null, checklistItems = null } = options;
+  // Asked once per item per score, so the pin is normalised to a Set first.
+  const pin = checklistItems && typeof checklistItems.has !== 'function'
+    ? new Set(checklistItems)
+    : checklistItems;
+  return catalogItems(sections).filter((item) => isApplicable(item, profile, scopeSections, pin));
 }
