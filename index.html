@@ -10,6 +10,10 @@
     <meta name="apple-mobile-web-app-title" content="A·H·P Audit" />
     <title>A·H·P — Audit Console</title>
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <!-- Painted before the stylesheet or the bundle loads, so the very first
+         frame is dark rather than a white flash that then fills in. The same
+         rules live in src/index.css, which is what maintains them. -->
+    <style>html{background-color:#0C0C0F;color-scheme:dark}body{margin:0;background-color:#0C0C0F}</style>
   </head>
   <body>
     <div id="root"></div>

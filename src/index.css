@@ -1,0 +1,76 @@
+/*
+ * The page itself, beneath the application.
+ *
+ * Until this file existed the project shipped no stylesheet whatsoever:
+ * document.styleSheets.length was 0. That left two browser defaults in force
+ * and both were visible:
+ *
+ *   body { margin: 8px }        an 8px gutter on all four sides
+ *   html, body  transparent     so the gutter showed the white UA canvas
+ *
+ * The dark colour was set on a div inside #root by appStyle, so it began
+ * 8px in and the frame around it stayed white. That is the whole of the bug.
+ * It is fixed by giving the page a background and removing the margin, not by
+ * stretching the app or overriding anything inside it.
+ *
+ * Deliberately minimal. There is no global box-sizing rule and no typography
+ * reset here: the console styles itself inline and already sets box-sizing
+ * where it needs it, so a blanket rule would silently reflow controls that are
+ * correct today. This file owns the canvas and nothing else.
+ */
+
+:root {
+  /* The app shell's own background, so the page beneath it matches exactly
+     rather than approximately. Same value as the manifest background_color. */
+  --ahp-canvas: #0C0C0F;
+}
+
+html {
+  background-color: var(--ahp-canvas);
+
+  /* Tells the browser the page is dark. Without it the UA paints a white
+     canvas behind an overscroll on iOS and a light scrollbar on desktop, both
+     of which read as the frame this file removes. */
+  color-scheme: dark;
+
+  /* iOS Safari enlarges text on rotation unless told not to. Nothing in the
+     console is sized for that and it would break the item cards. */
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  /* The 8px UA default. This single line is the frame. */
+  margin: 0;
+  padding: 0;
+
+  background-color: var(--ahp-canvas);
+
+  /* So a short screen, the login form for instance, still paints dark all the
+     way down instead of ending where its content does. */
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+  background-color: var(--ahp-canvas);
+}
+
+/*
+ * Where the browser supports it, prefer the dynamic viewport unit.
+ *
+ * On iOS Safari 100vh is the height with the toolbars hidden, so it overflows
+ * while they are shown; 100dvh is the height actually available. This is
+ * additive: browsers without dvh keep the 100vh above.
+ */
+@supports (min-height: 100dvh) {
+  body, #root { min-height: 100dvh; }
+}
+
+/*
+ * The area an iOS rubber-band scroll exposes past the top or bottom of the
+ * document. It takes the html background, which is now dark, so this only has
+ * to stop the bounce revealing anything lighter behind a fixed header.
+ */
+@media (max-width: 900px) {
+  html { -webkit-tap-highlight-color: rgba(255, 255, 255, 0.06); }
+}
