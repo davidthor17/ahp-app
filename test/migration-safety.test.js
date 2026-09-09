@@ -22,6 +22,15 @@ const MIGRATIONS = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 const files = readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql'));
 const read = (f) => readFileSync(path.join(MIGRATIONS, f), 'utf8');
 
+// Storage migrations are held to a different and narrower rule than schema
+// ones. Creating a bucket is a row in storage.buckets, so it needs an insert
+// and cannot satisfy the blanket no-INSERT rule below. Rather than relax that
+// rule for every file, storage migrations are listed here and checked
+// separately, and their check is stricter: they may not name an audit table at
+// all, so an insert in one can never reach audit data.
+const STORAGE_MIGRATIONS = ['2026-09-09-phase60-photo-storage.sql'];
+const SCHEMA_FILES = files.filter((f) => !STORAGE_MIGRATIONS.includes(f));
+
 /** Executable SQL only: comments stripped, blank lines removed. */
 const statements = (body) => body
   .split('\n')
@@ -39,10 +48,10 @@ test('there are migrations to check, so this test is not vacuous', () => {
   }
 });
 
-test('no migration writes data, in any statement', () => {
-  for (const file of files) {
+test('no schema migration writes data, in any statement', () => {
+  for (const file of SCHEMA_FILES) {
     const sql = statements(read(file)).toLowerCase();
-    for (const verb of ['update ', 'delete ', 'truncate ', 'insert ']) {
+    for (const verb of ['update ', 'delete from', 'truncate ', 'insert ']) {
       assert.equal(sql.includes(verb), false, `${file} contains a ${verb.trim()} statement`);
     }
   }
@@ -141,4 +150,109 @@ test('the pin migration states the rollout order it depends on', () => {
   const raw = read('2026-09-09-phase58-checklist-pin.sql');
   assert.match(raw, /42703/, 'the file should name the failure the wrong order causes');
   assert.match(raw, /apply this migration/i);
+});
+
+// ── Phase 6.0: photo evidence ───────────────────────────────────────────────
+
+test('the photo evidence migration creates a table and alters nothing', () => {
+  const file = '2026-09-09-phase60-photo-evidence.sql';
+  assert.ok(files.includes(file), `${file} is missing`);
+  const sql = statements(read(file)).toLowerCase();
+
+  assert.match(sql, /create table if not exists public\.audit_item_photos/);
+  // The whole safety claim: it touches no existing table.
+  assert.equal(/alter table public\.audits\b/.test(sql), false, 'it must not alter audits');
+  assert.equal(/alter table public\.audit_items\b/.test(sql), false, 'it must not alter audit_items');
+  assert.equal(/alter table public\.properties\b/.test(sql), false, 'it must not alter properties');
+  // Its only ALTER is enabling RLS on the table it just made.
+  assert.match(sql, /alter table public\.audit_item_photos\s+enable row level security/);
+});
+
+test('photo evidence is bound to the audit, the item and the shift', () => {
+  // The same checklist item is evaluated once per shift, and D699 already
+  // holds one graded differently in two. A photo keyed on (audit, item) alone
+  // would be evidence for a verdict nobody could identify.
+  const sql = statements(read('2026-09-09-phase60-photo-evidence.sql')).toLowerCase();
+  assert.match(sql, /foreign key \(audit_id, item_id, shift_id\)/);
+  assert.match(sql, /references public\.audit_items \(audit_id, item_id, shift_id\)/);
+  assert.match(sql, /on delete cascade/);
+  const flat = sql.replace(/\s+/g, ' ');
+  for (const col of ['audit_id uuid not null', 'item_id text not null', 'shift_id text not null', 'storage_path text not null']) {
+    assert.ok(flat.includes(col), `missing: ${col}`);
+  }
+});
+
+test('photo evidence carries no public read policy', () => {
+  // Phase 6.0 does not publish evidence, and the absence of the policy is what
+  // guarantees that rather than the absence of a button.
+  const sql = statements(read('2026-09-09-phase60-photo-evidence.sql')).toLowerCase();
+  assert.match(sql, /create policy "internal manages own audit item photos"/);
+  assert.match(sql, /create policy "internal reads all audit item photos"/);
+  assert.match(sql, /create policy "reviewer reads all audit item photos"/);
+  assert.equal(/public reads/.test(sql), false, 'no public policy may exist yet');
+  assert.equal(/to anon/.test(sql), false, 'and anon is granted nothing');
+});
+
+test('the reviewer is given select on evidence and nothing more', () => {
+  const sql = statements(read('2026-09-09-phase60-photo-evidence.sql')).toLowerCase();
+  const reviewer = sql.slice(sql.indexOf('create policy "reviewer reads all audit item photos"'));
+  const block = reviewer.slice(0, reviewer.indexOf(';') + 1);
+  assert.match(block, /for select/);
+  assert.equal(/for all/.test(block), false, 'a reviewer must never get an ALL policy');
+});
+
+test('the storage migration touches storage only and never an audit table', () => {
+  const file = '2026-09-09-phase60-photo-storage.sql';
+  assert.ok(files.includes(file), `${file} is missing`);
+  assert.ok(STORAGE_MIGRATIONS.includes(file), 'and it is declared as a storage migration');
+  const sql = statements(read(file)).toLowerCase();
+
+  // The narrower rule that replaces the blanket no-INSERT one: the only insert
+  // it may carry is the bucket itself.
+  const inserts = sql.match(/insert\s+into\s+([a-z_.]+)/g) || [];
+  assert.deepEqual(inserts, ['insert into storage.buckets'], 'only the bucket may be inserted');
+  for (const t of ['public.audits', 'public.audit_items', 'public.properties', 'public.audit_item_photos']) {
+    assert.equal(sql.includes(`into ${t}`), false, `${file} must not write ${t}`);
+    assert.equal(new RegExp(`(update|delete\s+from)\s+${t.replace('.', '\.')}`).test(sql), false,
+      `${file} must not modify ${t}`);
+  }
+  assert.equal(/truncate/.test(sql), false);
+});
+
+test('the evidence bucket is private, size-limited and image-only', () => {
+  const sql = statements(read('2026-09-09-phase60-photo-storage.sql')).toLowerCase();
+  assert.match(sql, /'audit-evidence'/);
+  // The third positional value is `public`. It must be false.
+  assert.match(sql, /'audit-evidence',\s*'audit-evidence',\s*false/);
+  assert.equal(/public\)\s*values[^;]*true/.test(sql), false, 'the bucket must never be public');
+  assert.match(sql, /10485760/, 'a size limit is set');
+  assert.match(sql, /image\/jpeg/);
+  assert.match(sql, /on conflict \(id\) do nothing/, 'and re-running it is harmless');
+});
+
+test('every storage policy gates on the audit id in the first path segment', () => {
+  // This is what makes a crafted path fail at the database rather than relying
+  // on the console to build a good one.
+  const sql = statements(read('2026-09-09-phase60-photo-storage.sql')).toLowerCase();
+  assert.match(sql, /\(storage\.foldername\(name\)\)\[1\]/);
+  assert.match(sql, /a\.auditor_id = auth\.uid\(\)/);
+  // Every policy is scoped to this bucket, so none can reach another one.
+  const policies = sql.match(/create policy[^;]+;/g) || [];
+  assert.equal(policies.length, 3, 'three storage policies');
+  for (const p of policies) {
+    assert.match(p, /bucket_id = 'audit-evidence'/, 'every policy names the bucket');
+    assert.match(p, /to authenticated/, 'and none is granted to anon');
+  }
+});
+
+test('neither Phase 6.0 migration backfills or touches a historical audit', () => {
+  for (const file of ['2026-09-09-phase60-photo-evidence.sql', '2026-09-09-phase60-photo-storage.sql']) {
+    const raw = read(file).toLowerCase();
+    // Comments included: a commented backfill is the thing that gets pasted.
+    assert.equal(/update\s+public\.audits/.test(raw), false, file);
+    assert.equal(/update\s+public\.audit_items/.test(raw), false, file);
+    assert.equal(/delete\s+from\s+public\.audits/.test(raw), false, file);
+    assert.equal(/delete\s+from\s+public\.audit_items/.test(raw), false, file);
+    assert.equal(/deletes+froms+public.properties/.test(raw), false, file);
+  }
 });

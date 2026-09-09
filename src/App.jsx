@@ -26,6 +26,12 @@ import {
   shouldShowUpdateBanner,
 } from "./framework/appUpdate.js";
 import { initServiceWorkerUpdates } from "./swUpdate.js";
+import {
+  PHOTO_STATUS, photoKey, photoButtonLabel, canDelete as canDeletePhoto,
+  canRetry, afterUpload, deleteOutcome, deleteMessage, photoIsGoneFromAudit,
+  hasUnsavedPhotos, unloadWarning, validateFile,
+} from "./framework/photoEvidence.js";
+import { resizeImage, uploadPhoto, deletePhoto, loadPhotos, signedUrl } from "./photoUpload.js";
 
 // Stamped at build time by vite.config.js. Undefined under node --test, where
 // nothing reads it.
@@ -151,6 +157,16 @@ export default function AHPAudit() {
   // A new build is downloaded and waiting. Never acted on automatically.
   const [needRefresh, setNeedRefresh]     = useState(false);
   const applyUpdateRef                    = useRef(null);
+  // Photo evidence, keyed by "itemId shiftId" so it follows the same natural
+  // key as audit_items and cannot attach to the wrong shift. Held in state
+  // only: a Blob cannot go in localStorage, this project has no IndexedDB, and
+  // pretending otherwise would be the one way to silently lose evidence.
+  const [photos, setPhotos]               = useState({});
+  const [photoOpen, setPhotoOpen]         = useState(null);   // itemId whose tray is open
+  const [lightbox, setLightbox]           = useState(null);   // { url, label }
+  const [photoNotice, setPhotoNotice]     = useState(null);
+  const photosRef                         = useRef({});
+  useEffect(() => { photosRef.current = photos; }, [photos]);
   const [ids, setIds]                     = useState({ propertyId: null, auditId: null, auditRef: null });
   const [prop, setProp]                   = useState({
     name: '', city: '', country: '', chain: false, chainName: '',
@@ -687,6 +703,183 @@ export default function AHPAudit() {
     return () => { window.removeEventListener('online', retry); clearInterval(timer); };
   }, [session, ids.auditId, readOnly, flushPending]);
 
+  // ---------- photo evidence ----------
+  //
+  // A separate queue from the Phase 5.8 item queue, deliberately. That one
+  // holds JSON row patches and is flushed as a batch; this holds Blobs, which
+  // cannot be serialised, cannot be persisted anywhere this project has, and
+  // need a two-step upload with its own failure states. Folding them together
+  // would put binary data through the most safety-critical code in the app for
+  // no benefit.
+
+  const setPhotoList = useCallback((key, fn) => {
+    setPhotos(prev => ({ ...prev, [key]: fn(prev[key] || []) }));
+  }, []);
+
+  const replacePhoto = useCallback((key, localId, fn) => {
+    setPhotoList(key, list => list.map(p => (p.localId === localId ? fn(p) : p)));
+  }, [setPhotoList]);
+
+  /** Send one photo, from READY or from FAILED. Never called automatically. */
+  const runUpload = useCallback(async (key, photo, meta) => {
+    if (!session || readOnly || !ids.auditId) return;
+    replacePhoto(key, photo.localId, p => ({ ...p, status: PHOTO_STATUS.UPLOADING, error: null }));
+
+    const result = await uploadPhoto(supabase, {
+      auditId: ids.auditId,
+      itemId: photo.itemId,
+      shiftId: photo.shiftId,
+      sectionId: meta.sectionId,
+      label: meta.label,
+      photoId: photo.photoId,
+      blob: photo.blob,
+      mimeType: photo.mimeType,
+      width: photo.width,
+      height: photo.height,
+      uploadedBy: session.user.id,
+    });
+
+    // afterUpload refuses to reach SAVED without the row the server returned,
+    // so a stored file with no metadata can never read as saved evidence.
+    replacePhoto(key, photo.localId, p => afterUpload(p, result));
+  }, [session, readOnly, ids.auditId, replacePhoto]);
+
+  /** Attach files chosen from the camera or the library. */
+  const attachPhotos = useCallback(async (itemId, fileList) => {
+    if (readOnly) return;
+    const meta = ITEM_INDEX[itemId];
+    if (!meta) return;
+    const key = photoKey(itemId, activeShiftId);
+    const files = Array.from(fileList || []);
+
+    for (const file of files) {
+      const check = validateFile(file);
+      if (!check.ok) { setPhotoNotice(check.reason); continue; }
+
+      // Resized before anything else. A 5 MB camera original over hotel wifi
+      // is how an audit stops halfway through a corridor.
+      const { blob, width, height } = await resizeImage(file);
+      const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const photoId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : localId;
+      const entry = {
+        localId, photoId, itemId, shiftId: activeShiftId,
+        blob, mimeType: blob.type || file.type, width, height,
+        previewUrl: URL.createObjectURL(blob),
+        status: PHOTO_STATUS.READY, error: null, remote: null,
+      };
+      setPhotoList(key, list => [...list, entry]);
+
+      if (!session || !ids.auditId) {
+        replacePhoto(key, localId, p => ({
+          ...p, status: PHOTO_STATUS.FAILED,
+          error: 'You are signed out, so this photo has not been uploaded.',
+        }));
+        continue;
+      }
+      await runUpload(key, entry, meta);
+    }
+  }, [readOnly, activeShiftId, session, ids.auditId, setPhotoList, replacePhoto, runUpload]);
+
+  const retryPhoto = useCallback((itemId, localId) => {
+    const key = photoKey(itemId, activeShiftId);
+    const photo = (photosRef.current[key] || []).find(p => p.localId === localId);
+    const meta = ITEM_INDEX[itemId];
+    if (photo && meta && canRetry(photo)) runUpload(key, photo, meta);
+  }, [activeShiftId, runUpload]);
+
+  /**
+   * Remove a photo. Metadata first, then the file, because the half-done state
+   * that leaves is an unreferenced file rather than a console showing evidence
+   * that cannot be opened.
+   */
+  const removePhoto = useCallback(async (itemId, localId) => {
+    if (readOnly) return;
+    const key = photoKey(itemId, activeShiftId);
+    const photo = (photosRef.current[key] || []).find(p => p.localId === localId);
+    if (!photo || !canDeletePhoto(photo, { readOnly })) return;
+
+    // Never uploaded: it exists only here, so dropping it is the whole job.
+    if (!photo.remote) {
+      if (photo.previewUrl) URL.revokeObjectURL(photo.previewUrl);
+      setPhotoList(key, list => list.filter(p => p.localId !== localId));
+      return;
+    }
+
+    const res = await deletePhoto(supabase, {
+      photoId: photo.remote.id, storagePath: photo.remote.storagePath,
+    });
+    const outcome = deleteOutcome(res);
+    const message = deleteMessage(outcome);
+    if (message) setPhotoNotice(message);
+
+    if (photoIsGoneFromAudit(outcome)) {
+      if (photo.previewUrl) URL.revokeObjectURL(photo.previewUrl);
+      setPhotoList(key, list => list.filter(p => p.localId !== localId));
+    }
+  }, [readOnly, activeShiftId, setPhotoList]);
+
+  /**
+   * Load the evidence already recorded for this audit.
+   *
+   * Its own effect rather than a line inside the item pull, so a failure here
+   * can never take the grades down with it. Photos arriving late is a slower
+   * screen; grades not arriving is an audit.
+   *
+   * Anything still in flight on this device is kept: the server does not know
+   * about it, so replacing state with the server's answer would erase exactly
+   * the photos that need keeping.
+   */
+  useEffect(() => {
+    if (!session || !ids.auditId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const rows = await loadPhotos(supabase, ids.auditId);
+        if (cancelled) return;
+        const next = {};
+        for (const r of rows) {
+          const key = photoKey(r.item_id, r.shift_id);
+          (next[key] = next[key] || []).push({
+            localId: r.id, photoId: r.id, itemId: r.item_id, shiftId: r.shift_id,
+            blob: null, mimeType: r.mime_type, width: r.width, height: r.height,
+            previewUrl: null, status: PHOTO_STATUS.SAVED, error: null,
+            remote: { id: r.id, storagePath: r.storage_path, createdAt: r.created_at },
+          });
+        }
+        setPhotos(prev => {
+          const merged = { ...next };
+          for (const [key, list] of Object.entries(prev)) {
+            const unsaved = list.filter(p => p.status !== PHOTO_STATUS.SAVED);
+            if (unsaved.length) merged[key] = [...(merged[key] || []), ...unsaved];
+          }
+          return merged;
+        });
+      } catch (e) { /* evidence is not the audit; grades are unaffected */ }
+    })();
+    return () => { cancelled = true; };
+  }, [session, ids.auditId]);
+
+  const openPhoto = useCallback(async (photo) => {
+    if (photo.previewUrl) { setLightbox({ url: photo.previewUrl, label: photo.itemId }); return; }
+    if (!photo.remote) return;
+    const url = await signedUrl(supabase, photo.remote.storagePath);
+    if (url) setLightbox({ url, label: photo.itemId });
+  }, []);
+
+  // Warn before leaving with photos that exist only on this device. The queue
+  // is in memory by design, so this is the honest mitigation rather than a
+  // durability promise the app cannot keep.
+  useEffect(() => {
+    const onBeforeUnload = (e) => {
+      if (!hasUnsavedPhotos(photosRef.current)) return;
+      e.preventDefault();
+      e.returnValue = unloadWarning(photosRef.current);
+      return e.returnValue;
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, []);
+
   const updateProp = (field, value) => setProp(p => ({ ...p, [field]: value }));
   const updateShiftTime = (shiftId, time) => setProp(p => ({ ...p, shiftTimes: { ...p.shiftTimes, [shiftId]: time } }));
   const toggleRoomType = (rt) => setProp(p => ({ ...p, roomTypes: p.roomTypes.includes(rt) ? p.roomTypes.filter(x => x !== rt) : [...p.roomTypes, rt] }));
@@ -958,6 +1151,114 @@ export default function AHPAudit() {
    * the queue is in memory and reloading past it loses grades the auditor has
    * already made. It clears itself as soon as the flush drains.
    */
+  /**
+   * The evidence tray for one item.
+   *
+   * Each thumbnail states its own condition rather than the tray stating a
+   * summary. SAVED is the only state drawn plainly; anything else is labelled
+   * on the tile, so a photo that has not reached the server cannot be mistaken
+   * for one that has just because it is visible.
+   */
+  const PhotoTray = ({ itemId, photos: list }) => (
+    <div style={{ marginBottom: '10px' }}>
+      <div style={{ display: 'flex', gap: '8px', overflowX: 'auto', paddingBottom: '4px', WebkitOverflowScrolling: 'touch' }}>
+        {list.map(photo => {
+          const failed = photo.status === PHOTO_STATUS.FAILED;
+          const busy = photo.status === PHOTO_STATUS.UPLOADING;
+          return (
+            <div key={photo.localId} style={{ position: 'relative', flexShrink: 0 }}>
+              <div onClick={() => openPhoto(photo)} style={{
+                width: '78px', height: '78px', borderRadius: '8px', overflow: 'hidden',
+                border: `1px solid ${failed ? 'rgba(224,85,85,0.6)' : busy ? C.goldBorder : C.border}`,
+                background: C.surface2, cursor: 'pointer', position: 'relative',
+                opacity: busy ? 0.6 : 1,
+              }}>
+                {photo.previewUrl
+                  ? <img src={photo.previewUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+                  : <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '20px', color: C.muted }}>🖼</div>}
+                {(failed || busy) && (
+                  <div style={{
+                    position: 'absolute', left: 0, right: 0, bottom: 0, padding: '3px 4px',
+                    background: failed ? 'rgba(224,85,85,0.9)' : 'rgba(12,12,15,0.8)',
+                    color: failed ? '#fff' : C.gold, fontSize: '9px', fontWeight: '700',
+                    letterSpacing: '0.04em', textAlign: 'center',
+                  }}>{failed ? 'NOT SAVED' : 'SAVING'}</div>
+                )}
+              </div>
+              {!readOnly && canDeletePhoto(photo, { readOnly }) && (
+                <button onClick={() => removePhoto(itemId, photo.localId)} aria-label="Remove photo" style={{
+                  position: 'absolute', top: '-6px', right: '-6px', width: '24px', height: '24px',
+                  borderRadius: '12px', border: `1px solid ${C.border}`, background: C.surface,
+                  color: C.dim, fontSize: '13px', lineHeight: '1', cursor: 'pointer', padding: 0,
+                }}>×</button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {list.some(p => p.status === PHOTO_STATUS.FAILED) && (
+        <div style={{ marginTop: '8px' }}>
+          {list.filter(p => p.status === PHOTO_STATUS.FAILED).map(p => (
+            <div key={p.localId} style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
+              <span style={{ flex: 1, fontSize: '11px', color: '#E05555', lineHeight: '1.4' }}>{p.error}</span>
+              {p.blob && (
+                <button onClick={() => retryPhoto(itemId, p.localId)} style={{
+                  flexShrink: 0, minHeight: '32px', padding: '6px 12px', borderRadius: '7px',
+                  border: `1px solid ${C.goldBorder}`, background: 'transparent', color: C.gold,
+                  fontSize: '11px', fontWeight: '700', cursor: 'pointer',
+                }}>RETRY</button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!readOnly && (
+        <label style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '44px',
+          marginTop: '8px', borderRadius: '8px', border: `1px dashed ${C.border}`,
+          color: C.muted, fontSize: '12px', fontWeight: '600', cursor: 'pointer',
+        }}>
+          + Add photo
+          {/* No capture attribute: iOS then offers Camera, Photo Library and
+              Browse, which is what an auditor needs. Forcing the camera would
+              remove the library. */}
+          <input type="file" accept="image/jpeg,image/png,image/webp" multiple
+            onChange={e => { attachPhotos(itemId, e.target.files); e.target.value = ''; }}
+            style={{ display: 'none' }} />
+        </label>
+      )}
+    </div>
+  );
+
+  /** Full-screen preview, and the one-line result of a partial deletion. */
+  const PhotoOverlays = () => (
+    <>
+      {photoNotice && (
+        <div onClick={() => setPhotoNotice(null)} style={{
+          padding: '9px 16px', background: C.warnBg, borderBottom: '1px solid rgba(245,166,35,0.3)',
+          fontSize: '12px', color: C.warn, lineHeight: '1.45', cursor: 'pointer',
+        }}>{photoNotice}</div>
+      )}
+      {lightbox && (
+        <div onClick={() => setLightbox(null)} style={{
+          position: 'fixed', inset: 0, zIndex: 200, background: 'rgba(8,8,10,0.94)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          padding: `env(safe-area-inset-top, 0px) 16px calc(24px + env(safe-area-inset-bottom, 0px))`,
+        }}>
+          <img src={lightbox.url} alt="" style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', borderRadius: '8px' }} />
+          <button onClick={() => setLightbox(null)} aria-label="Close" style={{
+            position: 'absolute', top: 'calc(12px + env(safe-area-inset-top, 0px))', right: '16px',
+            minWidth: '44px', minHeight: '44px', borderRadius: '22px',
+            border: `1px solid ${C.border}`, background: C.surface, color: C.text,
+            fontSize: '18px', cursor: 'pointer',
+          }}>×</button>
+        </div>
+      )}
+    </>
+  );
+
   const UpdateBar = () => {
     if (!shouldShowUpdateBanner(updateState)) return null;
     const stale = updateState === UPDATE_STATE.STALE;
@@ -1860,6 +2161,7 @@ export default function AHPAudit() {
           <div style={{ width: '32px' }} />
         </div>
         <UpdateBar />
+        <PhotoOverlays />
         {readOnly && <ReviewBar />}
         <ShiftBar />
         <div style={bodyStyle}>
@@ -1879,6 +2181,10 @@ export default function AHPAudit() {
             const activeData = getActiveData(item.id);
             const cfg = activeData.status ? STATUS[activeData.status] : null;
             const noteVisible = openNotes[item.id] || activeData.note;
+            // Evidence for this item in the shift being graded. The count is
+            // of photos actually stored: one in flight is not evidence yet.
+            const itemPhotos = photos[photoKey(item.id, activeShiftId)] || [];
+            const photoBadge = photoButtonLabel(itemPhotos);
             const inconsistent = isInconsistent(item.id);
             const anyDone = shifts.some(sh => getShiftData(item.id, sh.id).status);
             const focused = focusItemId === item.id;
@@ -2015,9 +2321,31 @@ export default function AHPAudit() {
                   ) : null
                 ) : (applicable && activeData.status && activeData.status !== 'na' && (
                   <>
-                    {!noteVisible && (
-                      <button onClick={() => setOpenNotes(p => ({ ...p, [item.id]: true }))} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: '12px', padding: '4px 0' }}>+ Add note</button>
+                    {/* Evidence and note, side by side. Both are 44px tall:
+                        these sit under the grade buttons and a mis-tap here
+                        opens the camera in a guest corridor. */}
+                    <div style={{ display: 'flex', gap: '8px', marginBottom: (noteVisible || photoOpen === item.id) ? '10px' : 0 }}>
+                      <button onClick={() => setPhotoOpen(photoOpen === item.id ? null : item.id)}
+                        style={{
+                          flex: 1, minHeight: '44px', padding: '11px 10px', borderRadius: '8px',
+                          border: `1px solid ${photoBadge.tone === 'bad' ? 'rgba(224,85,85,0.5)' : photoBadge.tone === 'ok' ? C.goldBorder : C.border}`,
+                          background: 'transparent', cursor: 'pointer', fontFamily: 'inherit',
+                          color: photoBadge.tone === 'bad' ? '#E05555' : photoBadge.tone === 'ok' ? C.gold : C.muted,
+                          fontSize: '12px', fontWeight: '600',
+                        }}>📷 {photoBadge.text}</button>
+                      <button onClick={() => setOpenNotes(p => ({ ...p, [item.id]: !noteVisible }))}
+                        style={{
+                          flex: 1, minHeight: '44px', padding: '11px 10px', borderRadius: '8px',
+                          border: `1px solid ${activeData.note ? C.goldBorder : C.border}`,
+                          background: 'transparent', cursor: 'pointer', fontFamily: 'inherit',
+                          color: activeData.note ? C.gold : C.muted, fontSize: '12px', fontWeight: '600',
+                        }}>📝 {activeData.note ? 'Note ✓' : 'Note'}</button>
+                    </div>
+
+                    {photoOpen === item.id && (
+                      <PhotoTray itemId={item.id} photos={itemPhotos} />
                     )}
+
                     {noteVisible && (
                       <textarea rows={2} autoFocus={!activeData.note} placeholder="Describe what you observed..."
                         value={activeData.note || ''} onChange={e => setNote(item.id, e.target.value)}
@@ -2026,6 +2354,12 @@ export default function AHPAudit() {
                     )}
                   </>
                 ))}
+                {/* A reviewer sees the evidence and cannot touch it. */}
+                {readOnly && itemPhotos.length > 0 && (
+                  <div style={{ marginTop: '10px' }}>
+                    <PhotoTray itemId={item.id} photos={itemPhotos} />
+                  </div>
+                )}
               </div>
             );
           })}
