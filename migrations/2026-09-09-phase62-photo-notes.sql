@@ -1,0 +1,112 @@
+-- Phase 6.2: an optional note on each piece of photo evidence
+--
+-- NOT APPLIED. Prepared for review.
+--
+-- Project: zbmhfdoqmzzscdklziss
+-- Affected: adds one nullable column to public.audit_item_photos. No other
+--           table is touched and no row is read, written or deleted. Adding a
+--           nullable column with no default is metadata only in Postgres 11+,
+--           so it does not rewrite the table however many rows it holds.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHY A COLUMN AND NOT SOMETHING ELSE
+--
+-- The note belongs to the photograph, not to the item. An auditor may attach
+-- three photos to one bathroom item and mean three different things by them:
+--
+--   "Water damage visible next to the shower"
+--   "Sealant lifting along the bath edge"
+--   "Extractor fan grille, for comparison"
+--
+-- audit_items.note already exists and is the auditor's note about the item as
+-- a whole. Reusing it would collapse those three captions into one and lose
+-- which photograph each described, so this is a column on the photo row and
+-- nowhere else.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+
+begin;
+
+-- Nullable, no default. A photo without a caption is the normal case, not a
+-- deficiency: requiring one would slow the field workflow this exists to
+-- serve, and an empty string would be a caption that says nothing rather than
+-- the absence of one.
+alter table public.audit_item_photos
+  add column if not exists note text;
+
+comment on column public.audit_item_photos.note is
+  'Optional caption written by the auditor for this one photograph. Null means no caption. Belongs to the photo, not to the item: audit_items.note is the note about the item as a whole.';
+
+commit;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- HOW EXISTING DATA BEHAVES
+--
+--   audit_item_photos  one new column, null on every existing row. A photo
+--                      taken before this simply has no caption, which is the
+--                      same thing a photo taken after it and left uncaptioned
+--                      will say. Nothing is backfilled.
+--   audits             unchanged, no column touched
+--   audit_items        unchanged, no column touched
+--   properties         unchanged, no column touched
+--   published reports  unchanged. published_result is a frozen payload at
+--                      formatVersion 1 and is not recomputed from anything
+--                      here. Evidence is still never published.
+--
+-- Nothing is backfilled and no caption is invented for any photograph.
+-- AHP-2026-8B10 and AHP-2026-D699 are untouched.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT THIS DELIBERATELY DOES NOT DO
+--
+-- It does not touch scoring, applicability, progress, the checklist pin, the
+-- snapshot basis, tier logic or legacy classification. A caption is evidence
+-- about evidence; nothing reads it to decide a number.
+--
+-- It adds no column for the Not Assessed work shipping alongside it, because
+-- none is needed. audit_items.na_reason already carries 'not_observed', which
+-- is exactly "available, but not assessed on this stay", and audit_items.
+-- na_note already exists from the Phase 4B migration and has never been
+-- written to. The optional explanation goes there.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ROLLOUT ORDER
+--
+--   1. apply this migration
+--   2. deploy the code
+--
+-- The code writes audit_item_photos.note on insert and on edit. Deploying
+-- first makes every photo upload fail with PGRST204, which the Phase 6.1 queue
+-- would correctly classify as a permanent refusal and report as REFUSED, so
+-- the failure would be loud rather than silent. Still the wrong order.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- VERIFICATION
+--
+--   select column_name, data_type, is_nullable, column_default
+--     from information_schema.columns
+--    where table_schema='public' and table_name='audit_item_photos'
+--      and column_name='note';
+--   -- expect: note, text, YES, null
+--
+--   select count(*) from public.audit_item_photos;          -- unchanged by this
+--   select count(*) from public.audit_item_photos where note is not null; -- 0
+--   select count(*) from public.audits;                     -- unchanged
+--   select count(*) from public.audit_items;                -- unchanged
+--
+-- Absolute counts are deliberately not asserted here: this is a live system
+-- and auditors add rows between a migration being written and being applied.
+-- What must hold is that this migration changes none of them.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ROLLBACK
+--
+--   begin;
+--   alter table public.audit_item_photos drop column if exists note;
+--   commit;
+--
+-- Safe while no caption has been written. Once auditors have written them the
+-- column holds evidence, so capture it first:
+--
+--   select audit_id, item_id, shift_id, storage_path, note
+--     from public.audit_item_photos where note is not null;

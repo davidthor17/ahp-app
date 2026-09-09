@@ -250,6 +250,10 @@ export function applyPending(remoteAudit = {}, queue = new Map()) {
       time:     patch.time ?? null,
       critical: !!patch.critical,
       naReason: patch.na_reason ?? null,
+      // Carried for the same reason na_reason is: a pending write reapplied
+      // over the server's rows must not silently drop the auditor's
+      // explanation of why an item was not experienced.
+      naNote: patch.na_note ?? null,
     };
     merged[itemId] = byShift;
   }

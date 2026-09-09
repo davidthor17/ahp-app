@@ -203,9 +203,19 @@ export default function AuditSummary({ result, certification, basis, palette: C,
             accent={C.text}
           />
         </div>
-        {result.naShare > 0 && (
+        {/* The two kinds of N/A do different things and must not be described
+            as one. Not Available leaves the audit entirely; Not Assessed is
+            excluded from the score but stays in coverage, because an item
+            nobody experienced was, accurately, not assessed. Saying "excluded
+            from both figures" of the second was simply untrue. */}
+        {result.weights && result.weights.structuralNa > 0 && (
           <div style={{ fontSize: '11px', color: C.muted, marginTop: '9px', lineHeight: '1.5' }}>
-            {result.naShare}% of the audit was marked not applicable and is excluded from both figures.
+            {result.structuralNaShare}% of the audit is not available at this property and is excluded from both figures.
+          </div>
+        )}
+        {result.weights && result.weights.observedNa > 0 && result.weights.applicable > 0 && (
+          <div style={{ fontSize: '11px', color: C.muted, marginTop: '6px', lineHeight: '1.5' }}>
+            {Math.round((result.weights.observedNa / result.weights.applicable) * 1000) / 10}% was not assessed on this stay. It never counts against the score, and it does count against coverage.
           </div>
         )}
       </div>

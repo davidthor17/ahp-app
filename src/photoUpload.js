@@ -12,7 +12,7 @@
 
 import {
   EVIDENCE_BUCKET, storagePath, pathBelongsToAudit, targetDimensions,
-  MAX_EDGE_PX, JPEG_QUALITY, validateFile,
+  MAX_EDGE_PX, JPEG_QUALITY, validateFile, normalisePhotoNote,
 } from './framework/photoEvidence.js';
 
 /**
@@ -91,7 +91,7 @@ async function ensureItemRow(supabase, { auditId, itemId, shiftId, sectionId, la
  * which costs space and tells no lies.
  */
 export async function uploadPhoto(supabase, {
-  auditId, itemId, shiftId, sectionId, label, photoId, blob, mimeType, width, height, uploadedBy,
+  auditId, itemId, shiftId, sectionId, label, photoId, blob, mimeType, width, height, uploadedBy, note,
 }) {
   const check = validateFile(blob);
   if (!check.ok) return { ok: false, error: check.reason };
@@ -130,8 +130,11 @@ export async function uploadPhoto(supabase, {
       width: width ?? null,
       height: height ?? null,
       uploaded_by: uploadedBy || null,
+      // Written with the insert rather than after it, so a caption typed before
+      // the upload finished cannot be lost between the two writes.
+      note: normalisePhotoNote(note),
     })
-    .select('id, storage_path, created_at')
+    .select('id, storage_path, created_at, note')
     .single();
 
   if (metaErr || !data) {
@@ -145,7 +148,7 @@ export async function uploadPhoto(supabase, {
 
   return {
     ok: true,
-    remote: { id: data.id, storagePath: data.storage_path, createdAt: data.created_at },
+    remote: { id: data.id, storagePath: data.storage_path, createdAt: data.created_at, note: data.note || null },
   };
 }
 
@@ -173,7 +176,7 @@ export async function deletePhoto(supabase, { photoId, storagePath: path }) {
 export async function loadPhotos(supabase, auditId) {
   const { data, error } = await supabase
     .from('audit_item_photos')
-    .select('id, item_id, shift_id, storage_path, mime_type, width, height, created_at')
+    .select('id, item_id, shift_id, storage_path, mime_type, width, height, created_at, note')
     .eq('audit_id', auditId)
     .order('created_at', { ascending: true });
   if (error) throw error;
@@ -193,4 +196,24 @@ export async function signedUrl(supabase, path, expiresInSeconds = 3600) {
     .createSignedUrl(path, expiresInSeconds);
   if (error || !data) return null;
   return data.signedUrl;
+}
+
+/**
+ * Change the caption on a photograph that is already stored.
+ *
+ * Its own call rather than part of the upload, because captions are usually
+ * written after the picture is taken and often edited afterwards. Returns the
+ * caption the server actually holds, so the console shows what was stored
+ * rather than what was typed: the same rule the upload follows.
+ */
+export async function updatePhotoNote(supabase, { photoId, note }) {
+  const value = normalisePhotoNote(note);
+  const { data, error } = await supabase
+    .from('audit_item_photos')
+    .update({ note: value })
+    .eq('id', photoId)
+    .select('id, note')
+    .maybeSingle();
+  if (error || !data) return { ok: false, error: error || null };
+  return { ok: true, note: data.note || null };
 }

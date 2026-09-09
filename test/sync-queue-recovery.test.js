@@ -26,7 +26,7 @@ import {
   createQueue, queueWrite, clearWrite, markFailure,
   pendingCount, pendingEntries, sendableEntries, blockedEntries, blockedCount,
   blockedReasons, blockedMessage, isPermanentError, describeError,
-  resolveSyncState, syncLabel, withTimeout, isTimeoutError,
+  resolveSyncState, syncLabel, withTimeout, isTimeoutError, applyPending,
 } from '../src/framework/syncQueue.js';
 
 const patch = (over = {}) => ({
@@ -336,4 +336,71 @@ test('the full 22-item scenario ends honestly rather than stuck', () => {
   assert.equal(state, SYNC.BLOCKED);
   assert.equal(syncLabel(state, 22, 22).text, 'REFUSED 22');
   assert.match(blockedMessage(blockedReasons(q)), /another auditor/);
+});
+
+// ── Phase 6.2: Not Assessed through the queue ───────────────────────────────
+//
+// The new state is carried by two existing columns, na_reason and na_note, so
+// it rides the queue exactly as a grade does. These assert that it actually
+// does, because a state that reaches the screen and not the server is the
+// failure this whole queue exists to make impossible.
+
+const naPatch = (over = {}) => ({
+  status: 'na', time: '09:00', note: null, critical: false,
+  na_reason: 'not_observed', na_note: null, ...over,
+});
+
+test('Not Assessed queues and clears like any other write', () => {
+  const q = createQueue();
+  queueWrite(q, 'SP-01', 'day', naPatch({ na_note: 'Did not use the spa' }));
+  assert.equal(pendingCount(q), 1);
+  assert.equal(pendingEntries(q)[0].patch.na_reason, 'not_observed');
+  assert.equal(pendingEntries(q)[0].patch.na_note, 'Did not use the spa');
+
+  clearWrite(q, 'SP-01', 'day');
+  assert.equal(resolveSyncState({ hasSession: true, pending: pendingCount(q) }), SYNC.SYNCED);
+});
+
+test('a temporary network failure does not lose the Not Assessed state', () => {
+  const q = createQueue();
+  queueWrite(q, 'SP-01', 'day', naPatch({ na_note: 'Restaurant not visited' }));
+  markFailure(q, 'SP-01', 'day', NETWORK);
+
+  assert.equal(pendingCount(q), 1, 'the write is retained');
+  assert.equal(blockedCount(q), 0, 'and is not blocked');
+  assert.equal(sendableEntries(q)[0].patch.na_note, 'Restaurant not visited',
+    'with the explanation intact for the retry');
+});
+
+test('a permanent refusal of a Not Assessed write surfaces as REFUSED', () => {
+  const q = createQueue();
+  queueWrite(q, 'SP-01', 'day', naPatch());
+  markFailure(q, 'SP-01', 'day', RLS);
+
+  const state = resolveSyncState({ hasSession: true, pending: 1, blocked: blockedCount(q) });
+  assert.equal(state, SYNC.BLOCKED);
+  assert.equal(syncLabel(state, 1, 1).text, 'REFUSED 1');
+  assert.match(blockedMessage(blockedReasons(q)), /another auditor/);
+});
+
+test('a pending Not Assessed write is reapplied over the server rows', () => {
+  // applyPending must carry na_note as well as na_reason, or a reapplied write
+  // would silently drop the auditor's explanation.
+  const q = createQueue();
+  queueWrite(q, 'SP-01', 'day', naPatch({ na_note: 'Pool not used' }));
+  const merged = applyPending({}, q);
+
+  assert.equal(merged['SP-01'].day.status, 'na');
+  assert.equal(merged['SP-01'].day.naReason, 'not_observed');
+  assert.equal(merged['SP-01'].day.naNote, 'Pool not used');
+});
+
+test('Not Assessed survives a pull that does not know about it yet', () => {
+  const remote = { 'RM-01': { day: { status: 'met', naReason: null, naNote: null } } };
+  const q = createQueue();
+  queueWrite(q, 'SP-01', 'day', naPatch({ na_note: 'Gym not visited' }));
+
+  const merged = applyPending(remote, q);
+  assert.equal(merged['RM-01'].day.status, 'met', 'the server row is kept');
+  assert.equal(merged['SP-01'].day.naNote, 'Gym not visited', 'and the unsaved state is not erased');
 });

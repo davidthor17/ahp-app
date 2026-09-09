@@ -35,9 +35,13 @@ import {
 import {
   PHOTO_STATUS, photoKey, photoButtonLabel, canDelete as canDeletePhoto,
   canRetry, afterUpload, deleteOutcome, deleteMessage, photoIsGoneFromAudit,
-  hasUnsavedPhotos, unloadWarning, validateFile,
+  hasUnsavedPhotos, unloadWarning, validateFile, normalisePhotoNote, canEditNote, PHOTO_NOTE_MAX,
 } from "./framework/photoEvidence.js";
-import { resizeImage, uploadPhoto, deletePhoto, loadPhotos, signedUrl } from "./photoUpload.js";
+import { resizeImage, uploadPhoto, deletePhoto, loadPhotos, signedUrl, updatePhotoNote } from "./photoUpload.js";
+import {
+  ITEM_STATE, NOT_ASSESSED_REASON, itemStateAcrossShifts, tallyStates,
+  progressLabel, allFinal, normaliseNaNote, NA_NOTE_SUGGESTIONS, NA_NOTE_MAX,
+} from "./framework/assessmentState.js";
 
 // Stamped at build time by vite.config.js. Undefined under node --test, where
 // nothing reads it.
@@ -601,7 +605,7 @@ export default function AHPAudit() {
             // na_reason likewise: without it a structural N/A returns reasonless
             // and is read as observational, which quietly moves the item back
             // into scope and costs the audit coverage it had already excluded.
-            remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time, critical: !!row.critical, naReason: row.na_reason || null };
+            remoteAudit[row.item_id][row.shift_id] = { status: row.status, note: row.note, time: row.time, critical: !!row.critical, naReason: row.na_reason || null, naNote: row.na_note || null };
           });
           // Anything still queued has not reached the database, so it is absent
           // from what came back. Adopting the remote set as it stands would
@@ -831,6 +835,9 @@ export default function AHPAudit() {
       width: photo.width,
       height: photo.height,
       uploadedBy: session.user.id,
+      // A caption typed before the upload finished travels with the insert, so
+      // it cannot be lost in the gap between the two writes.
+      note: photo.note || null,
     });
 
     // afterUpload refuses to reach SAVED without the row the server returned,
@@ -859,6 +866,7 @@ export default function AHPAudit() {
         localId, photoId, itemId, shiftId: activeShiftId,
         blob, mimeType: blob.type || file.type, width, height,
         previewUrl: URL.createObjectURL(blob),
+        note: null, noteDirty: false,
         status: PHOTO_STATUS.READY, error: null, remote: null,
       };
       setPhotoList(key, list => [...list, entry]);
@@ -873,6 +881,41 @@ export default function AHPAudit() {
       await runUpload(key, entry, meta);
     }
   }, [readOnly, activeShiftId, session, ids.auditId, setPhotoList, replacePhoto, runUpload]);
+
+  /**
+   * Type a caption. Local only: the write happens on blur.
+   *
+   * Keystroke-by-keystroke writes would put a row update on the wire for every
+   * letter, which on hotel wifi is the sync queue's worst case for no benefit.
+   */
+  const setPhotoNote = useCallback((itemId, localId, text) => {
+    const key = photoKey(itemId, activeShiftId);
+    replacePhoto(key, localId, p => ({ ...p, note: text, noteDirty: true }));
+  }, [activeShiftId, replacePhoto]);
+
+  /**
+   * Store the caption.
+   *
+   * Only for a photo the server already has: one still uploading carries its
+   * caption in the insert instead, so there is nothing to update yet and
+   * nothing can be lost between the two writes. A failure leaves the typed
+   * text on screen and marked dirty rather than reverting it, because silently
+   * discarding what the auditor wrote is the one outcome to avoid.
+   */
+  const commitPhotoNote = useCallback(async (itemId, localId) => {
+    if (readOnly) return;
+    const key = photoKey(itemId, activeShiftId);
+    const photo = (photosRef.current[key] || []).find(p => p.localId === localId);
+    if (!photo || !photo.noteDirty) return;
+    if (!photo.remote || !photo.remote.id) return;   // travels with the insert
+
+    const res = await updatePhotoNote(supabase, { photoId: photo.remote.id, note: photo.note });
+    if (res.ok) {
+      replacePhoto(key, localId, p => ({ ...p, note: res.note, noteDirty: false }));
+    } else {
+      setPhotoNotice('That caption could not be saved. It is still on this device.');
+    }
+  }, [readOnly, activeShiftId, replacePhoto]);
 
   const retryPhoto = useCallback((itemId, localId) => {
     const key = photoKey(itemId, activeShiftId);
@@ -936,7 +979,8 @@ export default function AHPAudit() {
           (next[key] = next[key] || []).push({
             localId: r.id, photoId: r.id, itemId: r.item_id, shiftId: r.shift_id,
             blob: null, mimeType: r.mime_type, width: r.width, height: r.height,
-            previewUrl: null, status: PHOTO_STATUS.SAVED, error: null,
+            previewUrl: null, note: r.note || null, noteDirty: false,
+            status: PHOTO_STATUS.SAVED, error: null,
             remote: { id: r.id, storagePath: r.storage_path, createdAt: r.created_at },
           });
         }
@@ -992,7 +1036,7 @@ export default function AHPAudit() {
       { status, naReason: reason },
     );
 
-    const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, status, time, naReason: reason } } };
+    const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, status, time, naReason: reason, naNote: reason ? (shiftPrev.naNote || null) : null } } };
     setAudit(updated); persist(prop, updated, ids);
     if (change) {
       recordTrail({
@@ -1000,7 +1044,8 @@ export default function AHPAudit() {
         from: shiftPrev.status || null, to: status === 'na' && reason ? `na:${reason}` : status,
       });
     }
-    pushItem(ids.auditId, itemId, activeShiftId, { status, time, note: shiftPrev.note || null, critical: !!shiftPrev.critical, na_reason: reason, na_note: null });
+    // na_note travels with the reason: moving off N/A clears both, staying on it keeps what was written.
+    pushItem(ids.auditId, itemId, activeShiftId, { status, time, note: shiftPrev.note || null, critical: !!shiftPrev.critical, na_reason: reason, na_note: reason ? (shiftPrev.naNote || null) : null });
   };
 
   // Opens the reason sheet rather than writing N/A directly. Every other status
@@ -1013,7 +1058,24 @@ export default function AHPAudit() {
     const shiftPrev = prev[activeShiftId] || {};
     const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, note } } };
     setAudit(updated); persist(prop, updated, ids);
-    pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note, time: shiftPrev.time || null, critical: !!shiftPrev.critical, na_reason: shiftPrev.naReason || null, na_note: null });
+    pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note, time: shiftPrev.time || null, critical: !!shiftPrev.critical, na_reason: shiftPrev.naReason || null, na_note: shiftPrev.naNote || null });
+  };
+
+  /**
+   * Why an item was not experienced.
+   *
+   * Goes to audit_items.na_note, a column that has existed since Phase 4B and
+   * has never been written to. Deliberately a different field from the item
+   * note and from a photo caption: they answer different questions and
+   * collapsing them would lose which was which.
+   */
+  const setNaNote = (itemId, text) => {
+    const prev = audit[itemId] || {};
+    const shiftPrev = prev[activeShiftId] || {};
+    const naNote = normaliseNaNote(text);
+    const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, naNote } } };
+    setAudit(updated); persist(prop, updated, ids);
+    pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note: shiftPrev.note || null, time: shiftPrev.time || null, critical: !!shiftPrev.critical, na_reason: shiftPrev.naReason || null, na_note: naNote });
   };
 
   const toggleCritical = (itemId) => {
@@ -1022,7 +1084,7 @@ export default function AHPAudit() {
     const critical = !shiftPrev.critical;
     const updated = { ...audit, [itemId]: { ...prev, [activeShiftId]: { ...shiftPrev, critical } } };
     setAudit(updated); persist(prop, updated, ids);
-    pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note: shiftPrev.note || null, time: shiftPrev.time || null, critical, na_reason: shiftPrev.naReason || null, na_note: null });
+    pushItem(ids.auditId, itemId, activeShiftId, { status: shiftPrev.status || null, note: shiftPrev.note || null, time: shiftPrev.time || null, critical, na_reason: shiftPrev.naReason || null, na_note: shiftPrev.naNote || null });
   };
 
   // every item ever flagged critical, across all shifts, regardless of current shift selection
@@ -1162,18 +1224,41 @@ export default function AHPAudit() {
     return statuses.length > 1 && new Set(statuses).size > 1;
   };
 
+  const shiftIds = shifts.map(s => s.id);
+
+  /**
+   * How far this section has got, split by what the auditor actually did.
+   *
+   * `done` still counts every item at a deliberate final state, which is what
+   * the finish gate has always used and what keeps a section containing an
+   * unvisited spa completable. The split alongside it is what stops Not
+   * Assessed reading as a failure: an item nobody experienced is finished, and
+   * it is not missed.
+   */
   const getSectionStats = (section) => {
     const applicable = section.items.filter(i => isItemApplicable(i.id));
-    const done = applicable.filter(i => shifts.some(s => (audit[i.id] || {})[s.id] && (audit[i.id] || {})[s.id].status));
-    const missed = applicable.filter(i => shifts.some(s => ((audit[i.id] || {})[s.id] || {}).status === 'missed')).length;
+    const tally = tallyStates(applicable.map(i => itemStateAcrossShifts(audit[i.id] || {}, shiftIds)));
     const inconsistent = applicable.filter(i => isInconsistent(i.id)).length;
-    return { total: applicable.length, done: done.length, missed, inconsistent };
+    return {
+      total: applicable.length,
+      done: tally.finished,
+      missed: tally.missed,
+      notAssessed: tally.notAssessed,
+      notAvailable: tally.notAvailable,
+      assessed: tally.assessed,
+      pending: tally.pending,
+      tally,
+      inconsistent,
+    };
   };
 
   const getOverallProgress = () => {
     const all = visibleSections.flatMap(s => s.items.filter(i => isItemApplicable(i.id)));
-    const done = all.filter(i => shifts.some(sh => ((audit[i.id] || {})[sh.id] || {}).status));
-    return { total: all.length, done: done.length };
+    const tally = tallyStates(all.map(i => itemStateAcrossShifts(audit[i.id] || {}, shifts.map(s => s.id))));
+    // done stays the count of items at a deliberate final state, so the finish
+    // gate and the percentage mean what they always did. The tally rides along
+    // for the breakdown beneath them.
+    return { total: all.length, done: tally.finished, tally };
   };
 
   // ── Framework v1 scoring, parallel to the legacy score above ─────────────
@@ -1288,6 +1373,28 @@ export default function AHPAudit() {
                   color: C.dim, fontSize: '13px', lineHeight: '1', cursor: 'pointer', padding: 0,
                 }}>×</button>
               )}
+              {/* A caption belongs to this one photograph. Three photos on a
+                  bathroom item can mean three different things, and the item
+                  note cannot record which was which. */}
+              {canEditNote(photo, { readOnly })
+                ? (
+                  <input
+                    value={photo.note || ''}
+                    maxLength={PHOTO_NOTE_MAX}
+                    placeholder="Caption"
+                    onChange={e => setPhotoNote(itemId, photo.localId, e.target.value)}
+                    onBlur={() => commitPhotoNote(itemId, photo.localId)}
+                    style={{
+                      width: '78px', marginTop: '5px', background: C.surface2,
+                      border: `1px solid ${C.border}`, borderRadius: '6px',
+                      padding: '5px 6px', color: C.text, fontSize: '10.5px',
+                      outline: 'none', boxSizing: 'border-box', fontFamily: 'inherit',
+                    }}
+                  />
+                )
+                : photo.note
+                  ? <div style={{ width: '78px', marginTop: '5px', fontSize: '10.5px', color: C.dim, lineHeight: '1.35', wordBreak: 'break-word' }}>{photo.note}</div>
+                  : null}
             </div>
           );
         })}
@@ -1992,7 +2099,7 @@ export default function AHPAudit() {
   }
 
   if (screen === 'home') {
-    const { total, done } = getOverallProgress();
+    const { total, done, tally: overallTally } = getOverallProgress();
     const pct = total ? Math.round((done / total) * 100) : 0;
     const totalInconsistent = visibleSections.reduce((acc, s) => acc + getSectionStats(s).inconsistent, 0);
     return (
@@ -2058,6 +2165,13 @@ export default function AHPAudit() {
             <div style={{ height: '3px', background: C.border, borderRadius: '2px' }}>
               <div style={{ height: '100%', width: pct + '%', background: C.gold, borderRadius: '2px', transition: 'width 0.3s' }} />
             </div>
+            {/* The breakdown the percentage cannot carry. An audit that is
+                100% complete with ten items not assessed is a different audit
+                from one where all ten were experienced, and the auditor should
+                be able to see which they have. */}
+            <div style={{ fontSize: '11.5px', color: C.muted, marginTop: '9px', lineHeight: '1.5' }}>
+              {progressLabel(overallTally)}
+            </div>
             {totalInconsistent > 0 && (
               <div style={{ marginTop: '12px', padding: '8px 12px', borderRadius: '7px', background: C.warnBg, border: '1px solid rgba(245,166,35,0.25)', fontSize: '12px', color: C.warn }}>
                 {totalInconsistent} item{totalInconsistent > 1 ? 's' : ''} inconsistent across shifts
@@ -2066,7 +2180,8 @@ export default function AHPAudit() {
           </div>
 
           {visibleSections.map(section => {
-            const { total: st, done: sd, missed, inconsistent } = getSectionStats(section);
+            const stats = getSectionStats(section);
+            const { total: st, done: sd, missed, inconsistent } = stats;
             const allDone = sd === st && st > 0;
             return (
               <div key={section.id} onClick={() => { setActiveSection(section.id); setScreen('section'); }}
@@ -2074,9 +2189,16 @@ export default function AHPAudit() {
                 <div style={{ width: '38px', height: '38px', borderRadius: '9px', background: C.surface2, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '17px', color: C.gold, flexShrink: 0 }}>{section.icon}</div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontWeight: '600', fontSize: '14px', marginBottom: '3px' }}>{section.label}</div>
+                  {/* Assessed, missed and not assessed are three different
+                      things to an auditor scanning for what still needs doing,
+                      so the line says all three rather than one total. */}
                   <div style={{ fontSize: '12px', color: C.dim }}>
-                    {sd}/{st} complete
-                    {missed > 0 && <span style={{ color: '#E05555', marginLeft: '8px' }}>· {missed} missed</span>}
+                    {stats.tally.assessed > 0 && <span>{stats.tally.assessed} assessed</span>}
+                    {missed > 0 && <span style={{ color: '#E05555' }}>{stats.tally.assessed > 0 ? ' · ' : ''}{missed} missed</span>}
+                    {stats.notAssessed > 0 && <span style={{ color: C.muted }}>{(stats.tally.assessed > 0 || missed > 0) ? ' · ' : ''}{stats.notAssessed} not assessed</span>}
+                    {stats.notAvailable > 0 && <span style={{ color: C.muted }}> · {stats.notAvailable} n/a</span>}
+                    {stats.pending > 0 && <span>{stats.done > 0 ? ' · ' : ''}{stats.pending} to do</span>}
+                    {stats.total === 0 && <span>nothing to do</span>}
                     {inconsistent > 0 && <span style={{ color: C.warn, marginLeft: '8px' }}>· {inconsistent} inconsistent</span>}
                     {allDone && <span style={{ color: '#4DC87A', marginLeft: '8px' }}>✓</span>}
                   </div>
@@ -2425,7 +2547,10 @@ export default function AHPAudit() {
                     {[
                       { id: NA_REASON.NOT_PRESENT, label: 'The property does not have it', hint: 'Left out of the audit entirely' },
                       { id: NA_REASON.NOT_OFFERED, label: 'The property does not offer it', hint: 'Left out of the audit entirely' },
-                      { id: NA_REASON.NOT_OBSERVED, label: 'It exists, but I could not assess it', hint: 'Stays in the audit as unassessed' },
+                      // The state this phase gave a name to. It was always
+                      // here as not_observed; it had no label an auditor would
+                      // recognise as "I did not use the spa".
+                      { id: NA_REASON.NOT_OBSERVED, label: 'Not assessed', hint: 'Available, but I did not experience it on this stay. Never counts against the score.' },
                     ].map(opt => (
                       <button key={opt.id} onClick={() => confirmNa(item.id, opt.id)} style={{
                         display: 'block', width: '100%', textAlign: 'left', marginBottom: '7px',
@@ -2441,12 +2566,44 @@ export default function AHPAudit() {
                 )}
 
                 {activeData.status === 'na' && activeData.naReason && naPrompt !== item.id && (
-                  <div style={{ fontSize: '11px', color: C.muted, marginBottom: '10px' }}>
-                    {activeData.naReason === NA_REASON.NOT_OBSERVED
-                      ? 'Not assessed on this stay'
-                      : 'Not part of this property'}
-                    {!readOnly && (
-                      <button onClick={() => requestNa(item.id)} style={{ background: 'none', border: 'none', color: C.gold, fontSize: '11px', cursor: 'pointer', padding: '0 0 0 8px' }}>Change</button>
+                  <div style={{ marginBottom: '10px' }}>
+                    <div style={{ fontSize: '11px', color: C.muted }}>
+                      {activeData.naReason === NOT_ASSESSED_REASON
+                        ? 'Not assessed on this stay'
+                        : 'Not part of this property'}
+                      {!readOnly && (
+                        <button onClick={() => requestNa(item.id)} style={{ background: 'none', border: 'none', color: C.gold, fontSize: '11px', cursor: 'pointer', padding: '0 0 0 8px' }}>Change</button>
+                      )}
+                    </div>
+                    {/* Why it was not experienced. Optional, always: an auditor
+                        made to type something to move on types anything, and
+                        nothing scores this. It goes to audit_items.na_note,
+                        which is a different field from the item note and from
+                        a photo caption. */}
+                    {activeData.naReason === NOT_ASSESSED_REASON && !readOnly && (
+                      <>
+                        <input
+                          value={activeData.naNote || ''}
+                          maxLength={NA_NOTE_MAX}
+                          placeholder="Why not? Optional"
+                          onChange={e => setNaNote(item.id, e.target.value)}
+                          style={{ width: '100%', marginTop: '8px', background: C.surface2, border: `1px solid ${C.border}`, borderRadius: '7px', padding: '9px 11px', color: C.text, fontSize: '12.5px', outline: 'none', boxSizing: 'border-box' }}
+                        />
+                        {!activeData.naNote && (
+                          <div style={{ display: 'flex', gap: '6px', overflowX: 'auto', marginTop: '6px', paddingBottom: '2px' }}>
+                            {NA_NOTE_SUGGESTIONS.map(sug => (
+                              <button key={sug} onClick={() => setNaNote(item.id, sug)} style={{
+                                flexShrink: 0, background: 'transparent', border: `1px solid ${C.border}`,
+                                borderRadius: '13px', padding: '6px 11px', color: C.muted,
+                                fontSize: '11px', cursor: 'pointer', fontFamily: 'inherit',
+                              }}>{sug}</button>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {activeData.naReason === NOT_ASSESSED_REASON && readOnly && activeData.naNote && (
+                      <div style={{ fontSize: '12px', color: C.dim, marginTop: '6px', fontStyle: 'italic' }}>{activeData.naNote}</div>
                     )}
                   </div>
                 )}

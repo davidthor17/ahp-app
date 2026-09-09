@@ -321,3 +321,29 @@ test('the owner storage migration adds one policy, scoped and authenticated', ()
   assert.equal(/insert\s+into/.test(sql), false, 'it creates no bucket');
   assert.equal(/to anon/.test(sql), false);
 });
+
+// ── Phase 6.2: the photo caption column ─────────────────────────────────────
+
+test('the photo note migration adds exactly one nullable column', () => {
+  const file = '2026-09-09-phase62-photo-notes.sql';
+  assert.ok(files.includes(file), `${file} is missing`);
+  const sql = statements(read(file));
+
+  assert.match(sql, /add column if not exists\s+note\s+text/i);
+  assert.equal((sql.match(/add column/gi) || []).length, 1, 'exactly one column');
+  assert.equal(/not null/i.test(sql), false);
+  assert.equal(/default/i.test(sql), false, 'a caption has no sensible default');
+  // It must touch nothing but the photo table.
+  assert.equal(/alter table public\.audits\b/i.test(sql), false);
+  assert.equal(/alter table public\.audit_items\b/i.test(sql), false);
+});
+
+test('the photo note migration records that Not Assessed needs no column', () => {
+  // The investigation's finding, written down where the next person will look:
+  // na_reason already carries not_observed and na_note has existed unused
+  // since Phase 4B, so the second half of the phase is naming, not schema.
+  const raw = read('2026-09-09-phase62-photo-notes.sql');
+  assert.match(raw, /not_observed/);
+  assert.match(raw, /na_note/);
+  assert.match(raw, /adds no column for the Not Assessed work/i);
+});

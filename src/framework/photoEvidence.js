@@ -249,3 +249,44 @@ export function validateFile(file) {
   }
   return { ok: true, reason: null };
 }
+
+// ── the caption ─────────────────────────────────────────────────────────────
+
+/**
+ * A caption belongs to one photograph, not to the item.
+ *
+ * An auditor may attach three photos to one bathroom item and mean three
+ * different things by them. audit_items.note is the note about the item as a
+ * whole; collapsing captions into it would lose which photograph said what.
+ *
+ * Always optional. A photo saved without one is the normal case.
+ */
+export const PHOTO_NOTE_MAX = 300;
+
+export function normalisePhotoNote(text) {
+  if (typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;               // empty is absent, never a caption
+  return trimmed.slice(0, PHOTO_NOTE_MAX);
+}
+
+export const hasPhotoNote = (photo) => Boolean(photo && normalisePhotoNote(photo.note));
+
+/** How many of these photographs carry a caption. */
+export const countWithNotes = (photos = []) => photos.filter(hasPhotoNote).length;
+
+/**
+ * May this caption be edited?
+ *
+ * A reviewer never edits. An upload in flight is not editable because the row
+ * it would be written to does not exist yet; the caption travels with the
+ * insert instead.
+ */
+export function canEditNote(photo, { readOnly = false } = {}) {
+  if (readOnly || !photo) return false;
+  return photo.status !== PHOTO_STATUS.UPLOADING;
+}
+
+/** A caption is only persisted separately once the photo itself exists. */
+export const noteNeedsWrite = (photo) =>
+  Boolean(photo && photo.status === PHOTO_STATUS.SAVED && photo.remote && photo.remote.id);

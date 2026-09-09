@@ -22,6 +22,7 @@ import {
   canUpload, canRetry, canDelete, afterUpload,
   DELETE_RESULT, deleteOutcome, deleteMessage, photoIsGoneFromAudit,
   targetDimensions, MAX_EDGE_PX, JPEG_QUALITY, MAX_UPLOAD_BYTES,
+  PHOTO_NOTE_MAX, normalisePhotoNote, hasPhotoNote, countWithNotes, canEditNote, noteNeedsWrite,
 } from '../src/framework/photoEvidence.js';
 
 const AUDIT = '2254b423-d69f-4fca-9dbb-df4375889604';
@@ -290,4 +291,103 @@ test('the evidence settings are the approved ones', () => {
 test('a missing dimension resizes nothing rather than guessing', () => {
   assert.equal(targetDimensions(0, 100), null);
   assert.equal(targetDimensions(100, undefined), null);
+});
+
+// ── Phase 6.2: the caption on a photograph ──────────────────────────────────
+//
+// A caption belongs to one photograph, not to the item. An auditor may attach
+// three photos to one bathroom item and mean three different things by them,
+// and audit_items.note cannot record which said what.
+
+test('a photo can be saved without a caption', () => {
+  // The normal case, and it must stay the normal case: requiring one would
+  // slow the field workflow the feature exists to serve.
+  const p = photo();
+  assert.equal(hasPhotoNote(p), false);
+  assert.equal(normalisePhotoNote(p.note), null);
+  assert.equal(afterUpload(p, { ok: true, remote: { id: PHOTO, storagePath: 'a/b/c/d.jpg' } }).status, PHOTO_STATUS.SAVED);
+});
+
+test('a photo can be saved with a caption', () => {
+  const p = saved({ note: 'Water damage visible next to the shower' });
+  assert.equal(hasPhotoNote(p), true);
+  assert.equal(normalisePhotoNote(p.note), 'Water damage visible next to the shower');
+});
+
+test('multiple photos on one item carry different captions', () => {
+  // The whole reason this is a column on the photo and not on the item.
+  const list = [
+    saved({ localId: 'a', note: 'Water damage next to the shower' }),
+    saved({ localId: 'b', note: 'Sealant lifting along the bath edge' }),
+    saved({ localId: 'c', note: null }),
+  ];
+  assert.equal(countWithNotes(list), 2);
+  assert.notEqual(list[0].note, list[1].note);
+  assert.equal(list[2].note, null, 'and one may have none');
+});
+
+test('an empty caption is absent, never an empty string', () => {
+  assert.equal(normalisePhotoNote(''), null);
+  assert.equal(normalisePhotoNote('   '), null);
+  assert.equal(normalisePhotoNote(null), null);
+  assert.equal(normalisePhotoNote(undefined), null);
+  assert.equal(normalisePhotoNote(42), null);
+});
+
+test('a caption is trimmed and bounded', () => {
+  assert.equal(normalisePhotoNote('  Dust on the bedside table  '), 'Dust on the bedside table');
+  assert.equal(normalisePhotoNote('x'.repeat(PHOTO_NOTE_MAX + 100)).length, PHOTO_NOTE_MAX);
+  assert.equal(PHOTO_NOTE_MAX, 300);
+});
+
+test('existing photos without a caption remain valid', () => {
+  // Every photo taken before this column existed. Nothing is backfilled and
+  // nothing invents a caption for them.
+  const legacy = saved();
+  delete legacy.note;
+  assert.equal(hasPhotoNote(legacy), false);
+  assert.equal(isSaved(legacy), true, 'and it is still a saved photo');
+  assert.equal(countWithNotes([legacy]), 0);
+});
+
+test('a caption survives the round trip the console performs', () => {
+  // What loadPhotos returns, mapped as the console maps it.
+  const row = { id: PHOTO, item_id: 'BTH-01', shift_id: 'day', storage_path: 'a/b/c/d.jpg', note: 'Grout stained along the base' };
+  const hydrated = { localId: row.id, photoId: row.id, itemId: row.item_id, shiftId: row.shift_id, note: row.note || null, status: PHOTO_STATUS.SAVED, remote: { id: row.id, storagePath: row.storage_path } };
+  assert.equal(hydrated.note, 'Grout stained along the base');
+  assert.equal(hasPhotoNote(hydrated), true);
+});
+
+test('a row with a null caption hydrates as no caption', () => {
+  const row = { id: PHOTO, note: null };
+  assert.equal(row.note || null, null);
+});
+
+test('a reviewer may read a caption and never edit it', () => {
+  const p = saved({ note: 'Excellent presentation and table setup' });
+  assert.equal(canEditNote(p, { readOnly: true }), false);
+  assert.equal(canEditNote(p, { readOnly: false }), true);
+  assert.equal(hasPhotoNote(p), true, 'but it is still visible to them');
+});
+
+test('a caption cannot be written separately while the photo is uploading', () => {
+  // There is no row to update yet: the caption travels with the insert, so it
+  // cannot be lost in the gap between the two writes.
+  const inflight = photo({ status: PHOTO_STATUS.UPLOADING, note: 'typed early' });
+  assert.equal(canEditNote(inflight, {}), false);
+  assert.equal(noteNeedsWrite(inflight), false);
+});
+
+test('only a stored photo needs its caption written separately', () => {
+  assert.equal(noteNeedsWrite(saved({ note: 'x' })), true);
+  assert.equal(noteNeedsWrite(photo({ note: 'x' })), false, 'READY carries it on the insert');
+  assert.equal(noteNeedsWrite(photo({ status: PHOTO_STATUS.FAILED, note: 'x' })), false);
+});
+
+test('a caption never affects whether a photo counts as evidence', () => {
+  // Captions are evidence about evidence. Nothing reads one to decide a number.
+  const withNote = [saved({ note: 'something' })];
+  const without = [saved()];
+  assert.equal(photoButtonLabel(withNote).text, photoButtonLabel(without).text);
+  assert.equal(countSaved(withNote), countSaved(without));
 });
