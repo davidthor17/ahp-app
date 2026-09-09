@@ -20,6 +20,8 @@ import { itemChangeIsMaterial, trailEntry } from "./framework/trail.js";
 import {
   SYNC, createQueue, queueWrite, clearWrite, pendingCount as queuedCount,
   pendingEntries, resolveSyncState, syncLabel, applyPending,
+  sendableEntries, blockedCount, blockedReasons, blockedMessage,
+  markFailure, isPermanentError, withTimeout,
 } from "./framework/syncQueue.js";
 import {
   UPDATE_STATE, updateBannerState, updateBannerText, buildAgeDays,
@@ -153,6 +155,11 @@ export default function AHPAudit() {
   // header re-renders when the count changes.
   const pendingRef                        = useRef(createQueue());
   const [pendingWrites, setPendingWrites] = useState(0);
+  // Writes the server has refused on grounds a retry cannot change. Kept apart
+  // from pendingWrites because they mean something different to the auditor:
+  // one is "still going", the other is "will never go".
+  const [blockedWrites, setBlockedWrites] = useState(0);
+  const [blockedInfo, setBlockedInfo]     = useState([]);
   const flushingRef                       = useRef(false);
   // A new build is downloaded and waiting. Never acted on automatically.
   const [needRefresh, setNeedRefresh]     = useState(false);
@@ -312,7 +319,11 @@ export default function AHPAudit() {
     // failed open would otherwise clear the message before it could be read.
     setBrowseLoading(true); setBrowseError(false);
     supabase.from('audits')
-      .select('id, ref, date, status, tier, property_id, properties(name, city, country)')
+      // auditor_id is selected because the write policy turns on it. RLS lets
+      // an internal user read every audit but modify only their own, so a list
+      // without it cannot tell a resumable audit from one that will refuse
+      // every grade the auditor subsequently makes.
+      .select('id, ref, date, status, tier, property_id, auditor_id, properties(name, city, country)')
       .order('date', { ascending: false })
       .then(({ data, error }) => {
         setBrowseLoading(false);
@@ -392,7 +403,22 @@ export default function AHPAudit() {
    * record. That guarantee is the reason this does not simply call
    * buildSnapshot, and it is the one thing here that must not be relaxed.
    */
+  /** Only the owner may resume an audit writably. See ownsAudit. */
+  const ownsAudit = useCallback(
+    (row) => Boolean(session && row && row.auditor_id && row.auditor_id === session.user.id),
+    [session],
+  );
+
   const resumeAudit = async (row) => {
+    // The authorization mismatch, closed at the door.
+    //
+    // "internal reads all audits" lets an auditor open anybody's audit; only
+    // "internal manages own audit items" governs writing, and it requires
+    // audits.auditor_id = auth.uid(). Resuming someone else's audit therefore
+    // produced a fully working capture screen in which every single write came
+    // back 42501, forever. The console must not offer a writable door it knows
+    // the database will refuse.
+    if (!ownsAudit(row)) { setOpenError('not-yours'); return; }
     // Resuming replaces what is on this device. Anything still queued belongs
     // to the audit being left behind and would go with it, so this refuses
     // rather than trading one recovered audit for another one's lost grades.
@@ -644,26 +670,68 @@ export default function AHPAudit() {
     if (!session || !auditId || readOnly) return;
     if (flushingRef.current) return;          // one flush at a time
     flushingRef.current = true;
-    let failed = false;
+    let transientFailure = false;
     try {
-      for (const { itemId, shiftId, patch } of pendingEntries(pendingRef.current)) {
+      // Only entries that are not already known to be refused. A blocked one
+      // stays in the queue and is reported, but is stepped over rather than
+      // retried, which is what stops one poisoned write holding every later
+      // write hostage at the head of the Map.
+      for (const { itemId, shiftId, patch } of sendableEntries(pendingRef.current)) {
         const meta = ITEM_INDEX[itemId];
-        if (!meta) { clearWrite(pendingRef.current, itemId, shiftId); continue; }
-        const { error } = await supabase.from('audit_items').upsert({
-          audit_id: auditId, item_id: itemId, section_id: meta.sectionId, label: meta.label,
-          shift_id: shiftId, ...patch,
-        }, { onConflict: 'audit_id,item_id,shift_id' });
-        if (error) { failed = true; break; }
+        if (!meta) {
+          // Not discarded. An id the catalogue no longer knows is a refusal
+          // like any other, and dropping the auditor's grade silently is the
+          // one outcome that must never happen.
+          markFailure(pendingRef.current, itemId, shiftId, {
+            code: 'UNKNOWN_ITEM', permanent: true,
+            message: `${itemId} is not in this version of the checklist.`,
+          });
+          continue;
+        }
+
+        // Bounded, and abortable. fetch has no timeout of its own, so without
+        // this a hung request never settles, the finally below never runs, and
+        // the lock above deadlocks the queue with the network apparently fine.
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        let error = null;
+        try {
+          const res = await withTimeout(
+            () => {
+              let q = supabase.from('audit_items').upsert({
+                audit_id: auditId, item_id: itemId, section_id: meta.sectionId, label: meta.label,
+                shift_id: shiftId, ...patch,
+              }, { onConflict: 'audit_id,item_id,shift_id' });
+              if (controller && typeof q.abortSignal === 'function') q = q.abortSignal(controller.signal);
+              return q;
+            },
+            { onTimeout: () => { if (controller) controller.abort(); } },
+          );
+          error = res && res.error ? res.error : null;
+        } catch (e) {
+          error = e;
+        }
+
+        if (error) {
+          // The code and message are kept against the entry. Before this they
+          // were discarded, so an RLS refusal and a dropped connection were
+          // indistinguishable to the app and to the auditor.
+          markFailure(pendingRef.current, itemId, shiftId, error);
+          if (isPermanentError(error)) continue;   // step over, keep going
+          transientFailure = true;
+          break;                                   // the connection is bad: stop
+        }
         // Cleared only once the server has taken it. This is the single point
         // at which a write stops being outstanding.
         clearWrite(pendingRef.current, itemId, shiftId);
       }
     } catch (e) {
-      failed = true;
+      transientFailure = true;
     } finally {
       flushingRef.current = false;
       setPendingWrites(queuedCount(pendingRef.current));
-      setSyncState(failed ? 'error' : 'synced');
+      setBlockedWrites(blockedCount(pendingRef.current));
+      setBlockedInfo(blockedReasons(pendingRef.current));
+      setSyncState(transientFailure ? 'error' : 'synced');
     }
   }, [session, readOnly]);
 
@@ -1134,9 +1202,11 @@ export default function AHPAudit() {
     hasSession: !!session,
     pending: pendingWrites,
     lastError: syncState === 'error',
+    blocked: blockedWrites,
   });
-  const syncBadge = syncLabel(effectiveSync, pendingWrites);
+  const syncBadge = syncLabel(effectiveSync, pendingWrites, blockedWrites);
   const SYNC_TONE = { ok: '#4DC87A', busy: C.gold, bad: '#E05555', muted: C.muted };
+  const refusedMessage = blockedMessage(blockedInfo);
 
   // ---------- app updates ----------
   const updateState = updateBannerState({
@@ -1231,6 +1301,27 @@ export default function AHPAudit() {
       )}
     </div>
   );
+
+  /**
+   * Writes the server has refused for good.
+   *
+   * Loud and permanent, because nothing about it will improve on its own and
+   * the auditor's grades are sitting on the device with nowhere to go. It says
+   * what happened and what to do, never "retrying".
+   */
+  const RefusedBar = () => {
+    if (!refusedMessage) return null;
+    return (
+      <div style={{
+        padding: '10px 16px', background: 'rgba(224,85,85,0.12)',
+        borderBottom: '1px solid rgba(224,85,85,0.45)',
+        fontSize: '12px', color: '#E05555', lineHeight: '1.5',
+      }}>
+        <strong style={{ fontWeight: '700' }}>Not saved to Specula. </strong>
+        {refusedMessage}
+      </div>
+    );
+  };
 
   /** Full-screen preview, and the one-line result of a partial deletion. */
   const PhotoOverlays = () => (
@@ -1775,6 +1866,7 @@ export default function AHPAudit() {
           </div>
         </div>
         <UpdateBar />
+        <RefusedBar />
         {isReviewer && <ReviewBar />}
         <div style={bodyStyle}>
           {accessExpired ? (
@@ -1795,7 +1887,12 @@ export default function AHPAudit() {
 
               {openError && (
                 <div style={{ marginBottom: '12px', padding: '12px 14px', borderRadius: '8px', background: C.warnBg, border: '1px solid rgba(245,166,35,0.25)' }}>
-                  {openError === 'pending' ? (
+                  {openError === 'not-yours' ? (
+                    <>
+                      <div style={{ fontSize: '13px', fontWeight: '600', color: C.warn, marginBottom: '3px' }}>That audit belongs to another auditor.</div>
+                      <div style={{ fontSize: '12px', color: C.dim, lineHeight: '1.5' }}>You can read it, but Specula will not accept changes to it from your account. Start your own audit for that property instead.</div>
+                    </>
+                  ) : openError === 'pending' ? (
                     <>
                       <div style={{ fontSize: '13px', fontWeight: '600', color: C.warn, marginBottom: '3px' }}>The audit on this device has unsaved changes.</div>
                       <div style={{ fontSize: '12px', color: C.dim, lineHeight: '1.5' }}>Opening another audit would replace it. Go back, wait for the header to read SYNCED, then try again.</div>
@@ -1827,12 +1924,23 @@ export default function AHPAudit() {
                 const p = a.properties || {};
                 const place = [p.city, p.country].filter(Boolean).join(', ');
                 const published = a.status === 'published';
+                // A reviewer opens anything, read only. An auditor may resume
+                // only their own: the database will refuse every write to
+                // anybody else's, so offering it would be offering a dead end.
+                const resumable = isReviewer || ownsAudit(a);
                 return (
-                  <div key={a.id} onClick={() => (isReviewer ? openAuditForReview(a) : resumeAudit(a))}
-                    style={card({ display: 'flex', alignItems: 'center', gap: '14px', cursor: 'pointer' })}>
+                  <div key={a.id} onClick={() => (isReviewer ? openAuditForReview(a) : resumable && resumeAudit(a))}
+                    style={card({
+                      display: 'flex', alignItems: 'center', gap: '14px',
+                      cursor: resumable ? 'pointer' : 'default',
+                      opacity: resumable ? 1 : 0.5,
+                    })}>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', flexWrap: 'wrap' }}>
                         <span style={{ fontSize: '10px', color: C.muted, letterSpacing: '0.08em', fontWeight: '600' }}>{a.ref}</span>
+                        {!resumable && (
+                          <span style={{ fontSize: '10px', color: C.muted, letterSpacing: '0.04em', padding: '1px 6px', borderRadius: '4px', border: `1px solid ${C.border}` }}>Another auditor</span>
+                        )}
                         <span style={{
                           fontSize: '10px', fontWeight: '600', letterSpacing: '0.04em', padding: '1px 6px', borderRadius: '4px',
                           color: published ? '#4DC87A' : C.dim,
@@ -1897,6 +2005,7 @@ export default function AHPAudit() {
           </div>
         )}
         <UpdateBar />
+        <RefusedBar />
         {readOnly && <ReviewBar />}
         <ShiftBar />
         <div style={bodyStyle}>
@@ -1977,6 +2086,7 @@ export default function AHPAudit() {
           <button onClick={() => setScreen('home')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Back</button>
         </div>
         <UpdateBar />
+        <RefusedBar />
         {readOnly && <ReviewBar />}
         <div style={bodyStyle}>
           <div style={{ marginBottom: '24px' }}>
@@ -2011,6 +2121,7 @@ export default function AHPAudit() {
         {/* Publishing from a stale bundle is the worst version of this problem,
             so the warning belongs here as much as anywhere. */}
         <UpdateBar />
+        <RefusedBar />
         <div style={bodyStyle}>
           <div style={{ marginBottom: '24px' }}>
             <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>FINISH & PUBLISH</div>
@@ -2161,6 +2272,7 @@ export default function AHPAudit() {
           <div style={{ width: '32px' }} />
         </div>
         <UpdateBar />
+        <RefusedBar />
         <PhotoOverlays />
         {readOnly && <ReviewBar />}
         <ShiftBar />
