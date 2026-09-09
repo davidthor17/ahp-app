@@ -29,6 +29,10 @@ import {
 } from "./framework/appUpdate.js";
 import { initServiceWorkerUpdates } from "./swUpdate.js";
 import {
+  canEditAudit as canEditAuditRule, isAdminRole, isInternalRole, isReviewerRole,
+  canBrowseAudits,
+} from "./framework/authorization.js";
+import {
   PHOTO_STATUS, photoKey, photoButtonLabel, canDelete as canDeletePhoto,
   canRetry, afterUpload, deleteOutcome, deleteMessage, photoIsGoneFromAudit,
   hasUnsavedPhotos, unloadWarning, validateFile,
@@ -289,15 +293,19 @@ export default function AHPAudit() {
   }, [session]);
 
   const role         = profile && profile.role ? profile.role : null;
-  const isReviewer   = role === 'reviewer';
+  const isReviewer   = isReviewerRole(role);
   const readOnly     = isReviewer;
   // Who may open the audit list. The database already answers this: the
   // "internal reads all audits" policy covers owner and auditor, and
   // "reviewer reads all audits" covers the reviewer, so letting an auditor
   // find a lost audit again needs no migration and no new policy. An auditor
   // resumes it writable; a reviewer still opens it read only.
-  const isInternal   = role === 'auditor' || role === 'owner';
-  const canBrowse    = isInternal || isReviewer;
+  const isInternal   = isInternalRole(role);
+  // The administrative tier. Backed by private.is_owner() and the four "owner
+  // manages all" policies, so this grants nothing on its own: it only lets the
+  // console offer what the database already permits.
+  const isAdmin      = isAdminRole(role);
+  const canBrowse    = canBrowseAudits(role);
   const expiresAt    = profile && profile.access_expires_at ? profile.access_expires_at : null;
   // Expiry is enforced by the database. This only picks the right empty state
   // so the reviewer sees a sentence instead of an empty list.
@@ -403,11 +411,29 @@ export default function AHPAudit() {
    * record. That guarantee is the reason this does not simply call
    * buildSnapshot, and it is the one thing here that must not be relaxed.
    */
-  /** Only the owner may resume an audit writably. See ownsAudit. */
-  const ownsAudit = useCallback(
-    (row) => Boolean(session && row && row.auditor_id && row.auditor_id === session.user.id),
-    [session],
+  /**
+   * May this account write to this audit?
+   *
+   * The mirror of the database, and it has to stay the mirror of it. Two
+   * rules, in the order the policies apply them:
+   *
+   *   owner    manages every audit         "owner manages all audits"
+   *   auditor  manages the audits it owns  "internal manages own audits"
+   *
+   * A reviewer reaches neither branch: they open audits through
+   * openAuditForReview instead, and there is no ALL policy for them anywhere
+   * in the schema.
+   *
+   * This decides what the console offers, and nothing about what the database
+   * permits. That is the point. If the two ever disagree the database wins and
+   * the auditor is handed a 42501 they cannot act on, which is the dead end
+   * this check exists to prevent rather than to create.
+   */
+  const canEditAudit = useCallback(
+    (row) => canEditAuditRule({ role, userId: session && session.user.id, audit: row }),
+    [role, session],
   );
+
 
   const resumeAudit = async (row) => {
     // The authorization mismatch, closed at the door.
@@ -418,7 +444,7 @@ export default function AHPAudit() {
     // produced a fully working capture screen in which every single write came
     // back 42501, forever. The console must not offer a writable door it knows
     // the database will refuse.
-    if (!ownsAudit(row)) { setOpenError('not-yours'); return; }
+    if (!canEditAudit(row)) { setOpenError('not-yours'); return; }
     // Resuming replaces what is on this device. Anything still queued belongs
     // to the audit being left behind and would go with it, so this refuses
     // rather than trading one recovered audit for another one's lost grades.
@@ -1927,7 +1953,7 @@ export default function AHPAudit() {
                 // A reviewer opens anything, read only. An auditor may resume
                 // only their own: the database will refuse every write to
                 // anybody else's, so offering it would be offering a dead end.
-                const resumable = isReviewer || ownsAudit(a);
+                const resumable = isReviewer || canEditAudit(a);
                 return (
                   <div key={a.id} onClick={() => (isReviewer ? openAuditForReview(a) : resumable && resumeAudit(a))}
                     style={card({

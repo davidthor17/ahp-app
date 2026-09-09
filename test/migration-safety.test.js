@@ -28,7 +28,7 @@ const read = (f) => readFileSync(path.join(MIGRATIONS, f), 'utf8');
 // rule for every file, storage migrations are listed here and checked
 // separately, and their check is stricter: they may not name an audit table at
 // all, so an insert in one can never reach audit data.
-const STORAGE_MIGRATIONS = ['2026-09-09-phase60-photo-storage.sql'];
+const STORAGE_MIGRATIONS = ['2026-09-09-phase60-photo-storage.sql', '2026-09-09-phase61-owner-admin-storage.sql'];
 const SCHEMA_FILES = files.filter((f) => !STORAGE_MIGRATIONS.includes(f));
 
 /** Executable SQL only: comments stripped, blank lines removed. */
@@ -255,4 +255,69 @@ test('neither Phase 6.0 migration backfills or touches a historical audit', () =
     assert.equal(/delete\s+from\s+public\.audit_items/.test(raw), false, file);
     assert.equal(/deletes+froms+public.properties/.test(raw), false, file);
   }
+});
+
+// ── Phase 6.1: the owner role gets the reach it already implies ─────────────
+
+test('the owner migration adds a function and policies, and alters nothing', () => {
+  const file = '2026-09-09-phase61-owner-admin-access.sql';
+  assert.ok(files.includes(file), `${file} is missing`);
+  const sql = statements(read(file)).toLowerCase();
+
+  assert.match(sql, /create or replace function private\.is_owner\(\)/);
+  assert.match(sql, /current_auditor_role\(\) = 'owner'/);
+  // Four tables, four permissive policies, nothing else.
+  assert.equal((sql.match(/create policy/g) || []).length, 4);
+  for (const t of ['public.audits', 'public.audit_items', 'public.audit_item_photos', 'public.properties']) {
+    assert.ok(sql.includes(`on ${t}`), `${t} is not covered`);
+  }
+  assert.equal(/alter table/.test(sql), false, 'no table is altered');
+});
+
+test('the owner migration drops no existing policy', () => {
+  // Editing the four "manages own" policies in place would mean dropping and
+  // recreating them, leaving a window governed by something unreviewed.
+  const sql = statements(read('2026-09-09-phase61-owner-admin-access.sql')).toLowerCase();
+  assert.equal(/drop policy/.test(sql), false);
+  assert.equal(/drop function/.test(sql), false);
+});
+
+test('the owner migration grants a reviewer nothing', () => {
+  // Read-only must survive an administrative tier being added above it.
+  const sql = statements(read('2026-09-09-phase61-owner-admin-access.sql')).toLowerCase();
+  assert.equal(/is_reviewer/.test(sql), false, 'it must not mention the reviewer at all');
+  assert.equal(/to anon/.test(sql), false);
+});
+
+test('the owner migration promotes nobody', () => {
+  // Granting the role is a one-row decision and must never be a side effect of
+  // a schema change. The migration-wide no-UPDATE rule already enforces this;
+  // this says why out loud.
+  const raw = read('2026-09-09-phase61-owner-admin-access.sql').toLowerCase();
+  assert.equal(/update\s+public\.auditors/.test(raw), false, 'even in a comment');
+  assert.equal(/insert\s+into\s+public\.auditors/.test(raw), false);
+  assert.match(raw, /separate, explicit, one-row decision/, 'and records that it is deliberate');
+});
+
+test('no migration hardcodes an email address as an authorization check', () => {
+  // The role model already had the right shape. Nothing may key on identity.
+  for (const file of files) {
+    const sql = statements(read(file)).toLowerCase();
+    assert.equal(/@speculaone\.com/.test(sql), false, `${file} hardcodes an email`);
+    assert.equal(/@gmail\.com/.test(sql), false, `${file} hardcodes an email`);
+  }
+});
+
+test('the owner storage migration adds one policy, scoped and authenticated', () => {
+  const file = '2026-09-09-phase61-owner-admin-storage.sql';
+  assert.ok(files.includes(file), `${file} is missing`);
+  assert.ok(STORAGE_MIGRATIONS.includes(file), 'and is declared a storage migration');
+  const sql = statements(read(file)).toLowerCase();
+
+  assert.equal((sql.match(/create policy/g) || []).length, 1);
+  assert.match(sql, /bucket_id = 'audit-evidence'/);
+  assert.match(sql, /to authenticated/);
+  assert.match(sql, /private\.is_owner\(\)/);
+  assert.equal(/insert\s+into/.test(sql), false, 'it creates no bucket');
+  assert.equal(/to anon/.test(sql), false);
 });
