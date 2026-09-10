@@ -80,8 +80,16 @@ test('no migration drops or renames an existing column', () => {
   }
 });
 
+// Phase 6.7's public_token column is the one deliberate exception: a public
+// access token has no meaningful null state, unlike every forensic/basis
+// column the other migrations add for rows that predate them. Carved out
+// here the same way storage migrations are carved out of the no-write rule
+// above, rather than weakening the rule itself.
+const DEFAULT_COLUMN_MIGRATIONS = ['2026-09-10-phase67-public-report-security.sql'];
+
 test('every column added is nullable with no default', () => {
   for (const file of files) {
+    if (DEFAULT_COLUMN_MIGRATIONS.includes(file)) continue;
     const sql = statements(read(file)).toLowerCase();
     if (!sql.includes('add column')) continue;
     assert.equal(sql.includes('not null'), false, `${file} adds a not null column`);
@@ -346,4 +354,177 @@ test('the photo note migration records that Not Assessed needs no column', () =>
   assert.match(raw, /not_observed/);
   assert.match(raw, /na_note/);
   assert.match(raw, /adds no column for the Not Assessed work/i);
+});
+
+// ── Phase 6.7: the public report security boundary ──────────────────────────
+//
+// These are text-level checks of the SQL itself, the same discipline every
+// migration in this file is held to — this repository has no live-database
+// test harness for RLS/grants, so the equivalent of a security regression
+// test here is proving the migration text does what it claims, byte for
+// byte, before it is ever applied. The REST-level checks in this file's
+// VERIFICATION section (run with the anon key, against the real project,
+// after applying) are what actually prove the grants behave as intended;
+// these tests prove the statements that will produce that behaviour are the
+// ones actually in the file.
+
+const P67 = '2026-09-10-phase67-public-report-security.sql';
+const p67sql = () => statements(read(P67)).toLowerCase();
+
+test('the public report security migration exists', () => {
+  assert.ok(files.includes(P67), `${P67} is missing`);
+});
+
+// 1, 13, 14 — anon cannot read internal audit columns (identity, commercial),
+// while still reading the ones report.js's real query proves it needs —
+// date, auditor_summary and critical_failures are not internal: they are the
+// same content publishedResult.js already freezes into published_result.
+test('anon loses table-wide SELECT on audits and is granted back an exact, verified-compatible column list', () => {
+  const sql = p67sql();
+  assert.match(sql, /revoke select on public\.audits from anon;/);
+  const grantLine = sql.match(/grant select \(([^)]*)\) on public\.audits to anon;/)[1];
+  const columns = grantLine.split(',').map((c) => c.trim()).sort();
+  assert.deepEqual(columns, [
+    'id', 'ref', 'date', 'status', 'tier', 'auditor_summary', 'critical_failures',
+    'published_result', 'property_id', 'public_token',
+  ].sort());
+  // Every internal/commercial/identity column the investigation found
+  // exposed must be provably absent from the granted list, not merely
+  // unmentioned — matched against the exact grant statement, not the whole
+  // file, so a column named only in prose cannot make this test pass by
+  // accident.
+  for (const col of [
+    'price_quoted', 'currency', 'opportunity_id', 'auditor_id',
+    'property_category', 'facility_profile', 'scope_sections', 'checklist_items',
+    'focus_area', 'start_date', 'end_date', 'created_at', 'updated_at',
+  ]) {
+    assert.equal(grantLine.includes(col), false, `${col} must not be in the anon grant list`);
+  }
+});
+
+// 3, 7, 11 — anon can retrieve exactly what report.js's real, current query
+// (read directly from speculaone-web, not inferred from ROLLOUT.md alone)
+// requests, so old published links — including the legacy, no-payload one —
+// keep resolving exactly as they do today.
+test('the audits grant matches report.js\'s real query exactly, embed column included', () => {
+  const raw = read(P67);
+  assert.match(raw, /id, ref, date, status, tier, auditor_summary, critical_failures/);
+  assert.match(raw, /published_result, property_id, public_token/);
+  assert.match(raw, /properties\(name, city, country, category\)/, 'the embed this grant supports must be documented');
+});
+
+// 2, 12 — anon cannot read internal audit_item fields (auditor notes, flags,
+// critical marks, photo references), while the one real, load-bearing
+// dependency — the legacy no-payload fallback for AHP-2026-8B10 — still works.
+test('anon\'s audit_items grant is narrowed to exactly the legacy-fallback columns, not removed entirely', () => {
+  const sql = p67sql();
+  assert.match(sql, /revoke select on public\.audit_items from anon;/);
+  const grantLine = sql.match(/grant select \(([^)]*)\) on public\.audit_items to anon;/)[1];
+  const columns = grantLine.split(',').map((c) => c.trim()).sort();
+  assert.deepEqual(columns, ['audit_id', 'item_id', 'section_id', 'status'].sort());
+  for (const col of ['note', 'flag', 'critical', 'photo', 'na_reason', 'na_note']) {
+    assert.equal(grantLine.includes(col), false, `${col} is auditor-written content and must not be in the grant`);
+  }
+});
+
+// 3 — anon cannot read properties broadly, but the embed's four confirmed
+// columns remain available — "unless a verified public report dependency
+// exists" is exactly the case here, confirmed by reading report.js.
+test('anon\'s properties grant is narrowed to exactly the embed\'s four columns, not removed entirely', () => {
+  const sql = p67sql();
+  assert.match(sql, /revoke select on public\.properties from anon;/);
+  const grantLine = sql.match(/grant select \(([^)]*)\) on public\.properties to anon;/)[1];
+  const columns = grantLine.split(',').map((c) => c.trim()).sort();
+  assert.deepEqual(columns, ['id', 'name', 'city', 'country', 'category'].sort());
+  for (const col of ['chain', 'room_count', 'has_pool', 'has_spa', 'notes', 'created_by', 'hotel_group_id']) {
+    assert.equal(grantLine.includes(col), false, `${col} is an operational/facility field and must not be in the grant`);
+  }
+});
+
+test('the migration records the corrected compatibility finding, and names the draft it replaces', () => {
+  const raw = read(P67);
+  assert.match(raw, /Nine columns, not five/);
+  assert.match(raw, /taken every\s*\n?-- public report offline/i);
+  assert.match(raw, /earlier draft of this migration made exactly that mistake/);
+});
+
+// 15 — photo evidence stays inaccessible; 17 — no secret is granted to make it so.
+test('anon loses every privilege on audit_item_photos, and none is granted back', () => {
+  const sql = p67sql();
+  assert.match(sql, /revoke select, insert, update, delete on public\.audit_item_photos from anon;/);
+  assert.equal(/grant[^;]*on public\.audit_item_photos to anon/.test(sql), false);
+});
+
+// 4, 5, 8, 9, 10 — unpublished audits stay hidden, and every role's access
+// not routed through anon is untouched, because no policy is touched at all.
+test('the migration drops or edits no existing policy, and grants nothing to authenticated', () => {
+  const sql = p67sql();
+  assert.equal(/drop policy/.test(sql), false);
+  assert.equal(/alter policy/.test(sql), false);
+  assert.equal(/create policy/.test(sql), false, 'row visibility is unchanged; only column grants move');
+  assert.equal(/to authenticated/.test(sql), false, 'authenticated — internal, reviewer, owner — must be untouched');
+  assert.equal(/is_owner|is_reviewer|is_internal/.test(sql), false, 'no role-check function is referenced at all');
+});
+
+// 6 — the identifier itself: public_token exists, is a real UUID, has real
+// (CSPRNG-backed) entropy, and is additive rather than a replacement for ref.
+test('public_token is added as a non-null, cryptographically random UUID', () => {
+  const sql = p67sql();
+  assert.match(sql, /add column if not exists\s+public_token\s+uuid\s+not null\s+default\s+gen_random_uuid\(\)/);
+  assert.match(sql, /create unique index if not exists audits_public_token_key on public\.audits \(public_token\)/);
+});
+
+test('the migration is deliberately exempt from the no-default rule, and says why', () => {
+  // Comment prose wraps across lines, each carrying its own "-- " marker,
+  // and shifts with any edit — strip the markers and flatten to one line
+  // before matching, rather than pinning to exact line breaks.
+  const flat = read(P67).split('\n').map((l) => l.replace(/^--\s?/, '')).join(' ').replace(/\s+/g, ' ');
+  assert.match(flat, /no meaningful null state/i);
+  assert.match(flat, /NOT NULL DEFAULT is used deliberately, the opposite choice/);
+});
+
+// 7 — backward compatibility: ref is never touched.
+test('ref is never dropped, renamed or regenerated by this migration', () => {
+  const sql = p67sql();
+  assert.equal(sql.includes('drop column'), false);
+  assert.equal(sql.includes('rename'), false);
+  assert.equal(/update\s+public\.audits\s+set\s+ref/.test(sql), false);
+  const raw = read(P67).toLowerCase();
+  assert.match(raw, /ref is not renamed, not dropped, not regenerated/);
+});
+
+test('the migration records the exact query it was scoped against, read from speculaone-web itself', () => {
+  // The empirical basis for the whole file — if this ever stops being true,
+  // the grant list above needs re-deriving, not just re-trusting. Names
+  // ROLLOUT.md as the earlier, incomplete source specifically so the next
+  // reader does not repeat the mistake of stopping there.
+  const raw = read(P67);
+  assert.match(raw, /select\('id, ref, date, status, tier, auditor_summary/);
+  assert.match(raw, /properties\(name, city, country, category\)/);
+  assert.match(raw, /ROLLOUT\.md/);
+  assert.match(raw, /records two queries from when Phase 5\.5 shipped/);
+});
+
+test('the migration documents that speculaone-web is not modified by it', () => {
+  const raw = read(P67).toLowerCase();
+  assert.match(raw, /it does not change speculaone-web/);
+});
+
+test('the migration is transactional and idempotent, like every other file here', () => {
+  const sql = p67sql();
+  assert.ok(sql.includes('begin;'));
+  assert.ok(sql.includes('commit;'));
+  const adds = (sql.match(/add column/g) || []).length;
+  const guarded = (sql.match(/add column if not exists/g) || []).length;
+  assert.equal(adds, guarded);
+});
+
+test('the migration writes no row — no insert, update, delete or truncate anywhere, comments included', () => {
+  // Deliberately checks the raw text, not just executable statements: the
+  // whole point of the earlier backfill test in this file is that a
+  // commented-out write is still the thing that gets pasted later.
+  const raw = read(P67).toLowerCase();
+  for (const verb of ['insert into', 'update public.', 'delete from', 'truncate ']) {
+    assert.equal(raw.includes(verb), false, `${P67} must not contain "${verb}", even in a comment`);
+  }
 });

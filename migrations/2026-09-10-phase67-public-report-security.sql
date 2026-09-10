@@ -1,0 +1,344 @@
+-- Phase 6.7 security remediation: the public report boundary
+--
+-- NOT APPLIED. Prepared for review. Nothing in this file has been run against
+-- the Supabase project.
+--
+-- Project: zbmhfdoqmzzscdklziss
+-- Affected: public.audits (adds one column, narrows anon's SELECT).
+--           public.audit_items, public.properties (anon's SELECT narrowed,
+--           not removed — see COMPATIBILITY below).
+--           public.audit_item_photos (anon's SELECT privilege revoked; also
+--           loses INSERT/UPDATE/DELETE it never had a policy for).
+-- No policy is dropped or edited. No row is read, written or deleted.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT WAS FOUND, AND HOW IT WAS CONFIRMED RATHER THAN ASSUMED
+--
+-- RLS on this schema is row-level only, confirmed directly against
+-- pg_policies and information_schema.role_table_grants. The public/anon
+-- role's three "public reads..." policies correctly restrict which ROWS
+-- anon may see — but the underlying GRANT behind them is the Supabase
+-- default, table-wide SELECT on every column. RLS was never the gap. The
+-- gap is that nothing ever narrowed the column grant to match what the
+-- public report actually reads. Confirmed live against production with the
+-- real anon key: an anonymous request retrieved a real audits.auditor_id
+-- and the raw critical_failures array for a published audit, and an
+-- unfiltered `select=*` against audit_items succeeded.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- COMPATIBILITY: READ FROM THE ACTUAL speculaone-web SOURCE, NOT INFERRED
+--
+-- migrations/ROLLOUT.md records two queries from when Phase 5.5 shipped and
+-- was taken, at first, as the complete picture. It was not. Reading
+-- speculaone-web/report.js directly (2026-09-10, read-only, at the
+-- project's explicit request) shows the real, current single query:
+--
+--   supabase.from('audits')
+--     .select('id, ref, date, status, tier, auditor_summary, '
+--            + 'critical_failures, published_result, '
+--            + 'properties(name, city, country, category)')
+--     .eq('ref', ref).eq('status', 'published').maybeSingle()
+--
+-- Nine columns, not five, and one embedded join. This is not optional
+-- padding: PostgREST rejects an entire request if any single requested
+-- column is unauthorized, so the query above running today with a column
+-- grant scoped to the five from ROLLOUT.md alone would have taken every
+-- public report offline — new ones included, not just legacy ones. An
+-- earlier draft of this migration made exactly that mistake; this version
+-- corrects it.
+--
+-- date, auditor_summary and critical_failures were wrongly grouped with
+-- genuinely internal fields in that draft. They are not internal: they are
+-- the same content publishedResult.js already freezes into published_result
+-- for every modern audit ("The auditor's prose, frozen with everything
+-- else"). report.js reads them from the raw columns only on its legacy
+-- branch (published_result absent — audits published before Phase 5.5, of
+-- which AHP-2026-8B10 is the one every migration in this directory has
+-- named). The initial query still requests them regardless of branch,
+-- because JS cannot know which branch it needs before the row comes back.
+--
+-- The properties(...) embed is a real, narrow, load-bearing dependency:
+-- name, city, country, category, used by the same legacy branch to render
+-- the property heading when published_result carries no property block of
+-- its own. It is not the broad live-query exposure Phase 5.5's header
+-- describes replacing — it asks for four columns, not the row.
+--
+-- report.js's second query, reached only when published_result is absent:
+--
+--   supabase.from('audit_items')
+--     .select('item_id, section_id, status').eq('audit_id', audit.id)
+--
+-- This is the load-bearing reason audit_items cannot simply lose all anon
+-- access: doing so would break AHP-2026-8B10's public report specifically,
+-- the one outcome every migration in this directory has been written to
+-- avoid. Three columns, not the row: no note, no flag, no critical, no
+-- photo, no na_reason, no na_note — none of the per-item content an
+-- auditor writes.
+--
+-- A repository-wide search (read-only) confirms this is the complete
+-- picture: owners-form.js is the only other file calling Supabase, and it
+-- only INSERTs into leads, a table this migration does not touch.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHY A COLUMN GRANT, NOT A NEW POLICY, NOT A VIEW
+--
+-- The fix belongs at the same layer as the bug. RLS already decides which
+-- ROWS anon may see, correctly, and this migration does not touch a single
+-- RLS policy — none is dropped, none is edited, none is added. What was
+-- missing sits one level up, in the GRANT that runs before RLS is even
+-- consulted: Postgres checks table/column privilege first, and REVOKEing
+-- the table-wide SELECT then GRANTing it back on an exact, narrow column
+-- list makes any request for a column outside that list fail outright,
+-- independent of which row it asks for. A view was considered and set
+-- aside for now: it would relocate the boundary rather than closing it
+-- (the base table would still need this same REVOKE, or the view could be
+-- bypassed by querying /rest/v1/audits directly), and speculaone-web
+-- already queries the tables by name, so today the plainer fix is also the
+-- one confirmed compatible with what it actually asks for. A view remains
+-- the better home for this once photo evidence or executive intelligence
+-- are approved for the public report — see the note near the end.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+
+begin;
+
+-- ── the public report identifier ─────────────────────────────────────────────
+--
+-- Created first, deliberately: the audits GRANT just below names
+-- public_token, so the column has to exist before that statement runs, not
+-- merely before the transaction commits. genRef() in App.jsx generated
+-- `AHP-{year}-{4 base36 chars from Math.random()}` — about 20.7 bits of
+-- entropy per year, drawn from a generator Node's own documentation says
+-- must not be used for anything security-sensitive. It is the entire
+-- access control for a public report URL today
+-- (speculaone.com/report.html?ref=...), so this is not a theoretical gap.
+--
+-- ref is not renamed, not dropped, not regenerated, and no existing row's
+-- ref changes. Every already-published report keeps resolving exactly as it
+-- does today. This is additive only: a new column, so a future report link
+-- can be built on something with real entropy behind it once speculaone-web
+-- is updated to issue links by public_token instead of ref — a change to
+-- that repository, deliberately not made here, and not made automatically
+-- even once this migration ships: it is its own explicit follow-up.
+--
+-- gen_random_uuid() is Postgres's own CSPRNG-backed generator (built in
+-- since v13, no extension required), producing a version-4 UUID: 122 bits
+-- of real randomness. NOT NULL DEFAULT is used deliberately, the opposite
+-- choice from every other migration in this directory: there is no
+-- meaningful null state for a token whose only job is to be hard to guess,
+-- and a volatile default (gen_random_uuid() is not constant) makes
+-- Postgres populate every existing row with a real value in the same
+-- statement, not defer it to a backfill. With 8 rows in the table today
+-- this is instant.
+alter table public.audits
+  add column if not exists public_token uuid not null default gen_random_uuid();
+
+create unique index if not exists audits_public_token_key on public.audits (public_token);
+
+comment on column public.audits.public_token is
+  'Cryptographically random public lookup identifier (gen_random_uuid(), ~122 bits), '
+  'intended to replace ref as the public report URL key once speculaone-web is updated '
+  'to issue links by it. Purely additive: ref keeps resolving every existing published '
+  'link exactly as before.';
+
+-- ── the public column boundary on audits ────────────────────────────────────
+--
+-- Revoke the table-wide default, then grant back exactly what report.js's
+-- one query is proven to request, plus property_id (needed for the
+-- properties(...) embed to resolve — PostgREST's embedded-resource join
+-- still requires SELECT on the foreign key column, even though it never
+-- appears in the select= list itself) and public_token, created above.
+-- Every column left out — price_quoted, currency, opportunity_id,
+-- auditor_id, property_category, facility_profile, scope_sections,
+-- framework_version, checklist_version, snapshot_locked_at,
+-- checklist_items, focus_area, start_date, end_date, created_at,
+-- updated_at — is exactly the internal state publishedResult.js's own
+-- header already said should never be public. This does not touch
+-- `authenticated` at all: internal, reviewer and owner access is
+-- unaffected, because none of that access runs as anon.
+revoke select on public.audits from anon;
+grant select (
+  id, ref, date, status, tier, auditor_summary, critical_failures,
+  published_result, property_id, public_token
+) on public.audits to anon;
+
+-- ── audit_items: narrowed to the three columns the legacy fallback needs ────
+--
+-- audit_id is the filter column (.eq('audit_id', audit.id)) and needs the
+-- same SELECT privilege a WHERE clause always needs. item_id and section_id
+-- are what recomputeFromItems() groups by; status is what it counts. Every
+-- column an auditor actually writes freeform — note, flag, critical, photo,
+-- na_reason, na_note — is not in this list and stays exactly as private as
+-- it is today.
+revoke select on public.audit_items from anon;
+grant select (audit_id, item_id, section_id, status) on public.audit_items to anon;
+
+-- ── properties: narrowed to the four columns the embed actually asks for ────
+--
+-- id is the join target (properties.id = audits.property_id) and needs the
+-- same privilege the join condition needs on either side. name, city,
+-- country, category are report.js's own explicit select list. Every
+-- operational/facility column — chain, room_count, has_pool, has_spa,
+-- menu_variety, shift_times, notes, created_by, hotel_group_id, and every
+-- other flag on this table — is not in this list.
+revoke select on public.properties from anon;
+grant select (id, name, city, country, category) on public.properties to anon;
+
+-- ── audit_item_photos: no policy ever made this reachable; the grant should
+--    not have been there to make it reachable either ─────────────────────────
+--
+-- report.js does not reference this table at all — confirmed by the same
+-- repository-wide search. Phase 6.0's own migration recorded "no public
+-- policy may exist yet" and "anon is granted nothing" as the guarantee that
+-- evidence stays private — true today only because RLS has no matching
+-- policy for anon, not because anon lacks the underlying privilege. It does
+-- have it: the Supabase default grant is per table, not per
+-- table-that-has-a-public-policy. This closes that gap so the guarantee
+-- holds for the reason it was meant to. Nothing today calls INSERT, UPDATE
+-- or DELETE as anon either; revoking them costs nothing real and removes
+-- privilege a careless future policy addition could otherwise silently
+-- reactivate.
+revoke select, insert, update, delete on public.audit_item_photos from anon;
+
+commit;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- genRef() ALSO STRENGTHENED, SEPARATELY, IN APPLICATION CODE
+--
+-- src/framework/reportIdentifier.js replaces Math.random() with
+-- crypto.getRandomValues() and widens the random suffix from 4 to 8 hex
+-- characters (32 bits, drawn two hex digits per byte so there is no modulo
+-- bias) — same visible shape (AHP-{year}-{suffix}), so nothing in the UI or
+-- in ref's role as a human-readable label changes, and nothing about it
+-- depends on this migration. This raises the entropy of every NEW ref by
+-- roughly 1,600x and removes the non-cryptographic source. It does not, on
+-- its own, close the guessability gap in the current public URL scheme —
+-- speculaone-web still looks reports up by ref, and a wider keyspace is a
+-- slower brute force, not an impossible one. public_token, once the reader
+-- requires it, is what actually closes that.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- HOW EXISTING ACCESS BEHAVES
+--
+--   anon         audits:      id, ref, date, status, tier, auditor_summary,
+--                              critical_failures, published_result,
+--                              property_id, public_token only — every other
+--                              column now refused at the privilege check,
+--                              before RLS runs, for every row regardless of
+--                              status.
+--                audit_items: audit_id, item_id, section_id, status only,
+--                              and only for rows RLS already allowed (a
+--                              published audit's items) — every auditor
+--                              note, flag, critical mark and photo
+--                              reference is refused. Was: every column.
+--                properties:  id, name, city, country, category only, and
+--                              only for rows RLS already allowed (a
+--                              property with a published audit) — every
+--                              operational/facility column is refused.
+--                              Was: every column.
+--                audit_item_photos: no access at all — unchanged in effect,
+--                              tightened in mechanism (see above).
+--   authenticated  entirely unaffected. Not one grant or policy touching
+--                  authenticated is changed by this file.
+--   internal       unaffected — "internal manages own" / "internal reads
+--                  all" policies are untouched and authenticated, not anon.
+--   reviewer       unaffected — same reasoning.
+--   owner          unaffected — same reasoning.
+--
+-- AHP-2026-8B10 and AHP-2026-D699 are untouched: their ref, published_result
+-- and every other column keep exactly the values they have today. Both gain
+-- a public_token they did not have before, generated once, by this migration.
+-- AHP-2026-8B10 specifically — the legacy, no-payload report — keeps
+-- rendering exactly as it does today: its query still succeeds end to end,
+-- verified column by column against what report.js actually asks for.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHAT THIS DELIBERATELY DOES NOT DO
+--
+-- It does not change speculaone-web. report.js keeps working unmodified,
+-- because every column and every embedded relationship it is proven to
+-- request remains grant-visible to anon, on every table it touches.
+-- Migrating it to look up by public_token instead of ref is a deliberate,
+-- separate follow-up in that repository, not a side effect of this one.
+--
+-- It does not add photo evidence to the public report. audit_item_photos
+-- gains no public policy here. If photo evidence is later approved for the
+-- public report, the safe mechanism is a narrow, server-side path — an edge
+-- function or RPC that checks the audit is published and the photo belongs
+-- to it before issuing a short-lived signed URL — never a public SELECT
+-- policy on the table and never a public storage bucket. That remains
+-- undesigned and is explicitly out of scope here.
+--
+-- It does not build the view a richer public contract will eventually want.
+-- Once evidence or executive intelligence are approved for the public
+-- report, a dedicated public_reports view (or a narrowly-scoped RPC) is the
+-- better home for the boundary than a widening column grant list on three
+-- base tables — flagged here so the next phase does not have to
+-- rediscover it.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ORDER
+--
+-- Independent of every other migration in this directory: it neither reads
+-- nor writes a column any of them add. It may be applied at any time.
+-- speculaone-web needs no corresponding deploy — every column and
+-- relationship it currently selects remains selectable, so this migration
+-- is safe to apply alone.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- VERIFICATION
+--
+-- Run with the anon/publishable key, exactly as a public visitor would:
+--
+--   -- must still succeed, unchanged, against a real published ref —
+--   -- the exact shape report.js sends, embed included:
+--   GET /rest/v1/audits?select=id,ref,date,status,tier,auditor_summary,critical_failures,published_result,properties(name,city,country,category)&ref=eq.AHP-2026-8B10&status=eq.published
+--
+--   -- must now fail — 42501/insufficient_privilege, not a filtered result:
+--   GET /rest/v1/audits?select=price_quoted,currency,opportunity_id,auditor_id
+--   GET /rest/v1/audit_items?select=note,flag,critical,photo,na_reason,na_note&limit=1
+--   GET /rest/v1/properties?select=chain,room_count,has_pool,notes&limit=1
+--   GET /rest/v1/audit_item_photos?select=*&limit=1
+--
+--   -- must still succeed, narrowed but present, for the legacy fallback path:
+--   GET /rest/v1/audit_items?select=audit_id,item_id,section_id,status&audit_id=eq.<AHP-2026-8B10's id>
+--
+--   -- must still fail exactly as before (row policy, unchanged):
+--   GET /rest/v1/audits?select=id,ref,published_result&status=eq.draft
+--
+-- And directly against the database:
+--
+--   select grantee, privilege_type from information_schema.role_table_grants
+--    where table_name in ('audits','audit_items','properties','audit_item_photos')
+--      and grantee = 'anon';                                            -- SELECT only, on the three; none on the fourth
+--
+--   select table_name, column_name from information_schema.column_privileges
+--    where grantee = 'anon' and privilege_type = 'SELECT'
+--      and table_name in ('audits','audit_items','properties')
+--    order by table_name, column_name;
+--   -- audits:      auditor_summary, critical_failures, date, id,
+--   --              property_id, public_token, published_result, ref,
+--   --              status, tier
+--   -- audit_items: audit_id, item_id, section_id, status
+--   -- properties:  city, country, id, name, category
+--
+--   select count(*) from public.audits where public_token is null;     -- expect 0
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ROLLBACK
+--
+--   begin;
+--   grant select on public.audits to anon;
+--   grant select on public.audit_items to anon;
+--   grant select on public.properties to anon;
+--   grant select, insert, update, delete on public.audit_item_photos to anon;
+--   commit;
+--
+-- Restores the exact grants this migration revoked, immediately and without
+-- touching a row. public_token is deliberately left in place rather than
+-- dropped: it is additive, nothing depends on its absence, and dropping it
+-- would only need reversing again the next time this is applied. Drop it
+-- separately and only if the column itself, not just the wider grants,
+-- needs to go:
+--
+--   alter table public.audits drop column if exists public_token;

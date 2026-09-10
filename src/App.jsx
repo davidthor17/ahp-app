@@ -4,6 +4,7 @@ import { SECTIONS } from "./auditItems.js";
 import AuditSummary from "./AuditSummary.jsx";
 import AuditIntelligencePanel from "./AuditIntelligencePanel.jsx";
 import ExecutiveReport from "./ExecutiveReport.jsx";
+import ClientReportPreview from "./ClientReportPreview.jsx";
 // Framework v1 scoring. Imported from the leaf modules rather than index.js so
 // no top-level await reaches the bundle. Runs alongside the legacy score in
 // Phase 2; it does not replace it, and nothing it produces is persisted.
@@ -11,6 +12,8 @@ import { score as frameworkScore } from "./framework/scoring.js";
 import { certify as frameworkCertify } from "./framework/certification.js";
 import { analyzeAuditIntelligence } from "./framework/auditIntelligence.js";
 import { buildExecutiveReport } from "./framework/executiveReport.js";
+import { buildClientReport } from "./framework/clientReport.js";
+import { genAuditRef } from "./framework/reportIdentifier.js";
 import { NA_REASON } from "./framework/weights.js";
 import {
   buildSnapshot, resolveScoringProfile, classifyLoadedAudit, canFreeze,
@@ -104,7 +107,6 @@ const C = {
 
 const STORAGE_KEY = 'ahp_v3';
 const nowTime = () => new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-const genRef = () => `AHP-${new Date().getFullYear()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 
 // prop (camelCase, UI state) -> properties table row (snake_case)
 const propToRow = (p, userId) => ({
@@ -298,6 +300,12 @@ export default function AHPAudit() {
   const [summaryDraft, setSummaryDraft]   = useState('');
   const [auditTier, setAuditTier]         = useState('full'); // desk | spot | full
   const [publishState, setPublishState]   = useState(PUBLISH_STATE.IDLE);
+  // Phase 6.7. Fetched fresh each time the preview opens, rather than
+  // inferred from publishState: an auditor can open the preview for an
+  // audit that was published in an earlier session, where publishState is
+  // still IDLE. The draft/published gate must reflect the server's own
+  // record, not this device's publish attempt history.
+  const [clientReportMeta, setClientReportMeta] = useState({ auditedOn: null, status: 'draft' });
   // React applies the disabled attribute on the next render, so two taps
   // inside one frame both fire. This ref is the guard the second tap sees.
   const publishingRef                     = useRef(false);
@@ -781,7 +789,7 @@ export default function AHPAudit() {
       let auditId = ids.auditId;
       let auditRef = ids.auditRef;
       if (!auditId) {
-        const ref = genRef();
+        const ref = genAuditRef();
         const { data, error } = await supabase.from('audits')
           .insert({ ref, property_id: propertyId, auditor_id: userId, status: 'draft' })
           .select('id').single();
@@ -1487,6 +1495,40 @@ export default function AHPAudit() {
     }),
     [frameworkResult, auditIntelligence, frameworkCertification],
   );
+
+  // Phase 6.7. The premium client report — a reduction over everything
+  // above, never a second computation of any of it. photos is read fresh
+  // from state so evidence reflects whatever is actually stored, and
+  // clientReportMeta.status is fetched on demand (see openClientReportPreview)
+  // so the draft/published gate is never wrong.
+  const clientReport = useMemo(
+    () => buildClientReport({
+      scoreResult: frameworkResult, intelligence: auditIntelligence, executiveReport,
+      certification: frameworkCertification, photos,
+      property: prop,
+      auditMeta: {
+        auditRef: ids.auditRef, auditType: auditTier,
+        auditedOn: clientReportMeta.auditedOn, status: clientReportMeta.status,
+      },
+    }),
+    [frameworkResult, auditIntelligence, executiveReport, frameworkCertification, photos, prop, ids.auditRef, auditTier, clientReportMeta],
+  );
+
+  /** Fetches the server's own publish status before showing the preview, so a
+   *  resumed audit published in an earlier session is never mistaken for a draft. */
+  const openClientReportPreview = async () => {
+    if (ids.auditId) {
+      try {
+        const { data } = await supabase.from('audits').select('date, status').eq('id', ids.auditId).maybeSingle();
+        setClientReportMeta({ auditedOn: data ? data.date : null, status: data && data.status === 'published' ? 'published' : 'draft' });
+      } catch (e) {
+        setClientReportMeta({ auditedOn: null, status: 'draft' });
+      }
+    } else {
+      setClientReportMeta({ auditedOn: null, status: 'draft' });
+    }
+    setScreen('clientReport');
+  };
 
   // Does publishing this audit need the legacy acknowledgement?
   //
@@ -2640,6 +2682,21 @@ export default function AHPAudit() {
               finding itself is already listed above. */}
           <AuditIntelligencePanel intelligence={auditIntelligence} palette={C} onOpenFinding={openFinding} />
 
+          {/* Phase 6.7. A preview of the premium client report this audit would
+              produce — draft-labelled until the audit is actually published,
+              and built from the same canonical data as everything above it. */}
+          <button
+            onClick={openClientReportPreview}
+            style={{
+              width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '14px 16px', marginBottom: '22px', borderRadius: '10px',
+              border: `1px solid ${C.goldBorder || C.border}`, background: C.goldBg || 'transparent',
+              color: C.gold, fontSize: '13px', fontWeight: '600', cursor: 'pointer', fontFamily: 'inherit',
+            }}>
+            Preview Client Report
+            <span>›</span>
+          </button>
+
           {/* Legacy scoring. Still the number that publishAudit() writes and the
               published report renders, so it stays visible and is labelled. */}
           {scorePct !== null && (
@@ -2777,6 +2834,26 @@ export default function AHPAudit() {
             </div>
           )}
         </div>
+      </div>
+    );
+  }
+
+  if (screen === 'clientReport') {
+    return (
+      <div style={appStyle}>
+        <div style={headerStyle}>
+          <span style={logoStyle}>A · H · P</span>
+          <button onClick={() => setScreen('finish')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>‹ Back to Review &amp; Publish</button>
+        </div>
+        <div style={bodyStyle}>
+          <ClientReportPreview
+            report={clientReport}
+            palette={C}
+            onOpenFinding={openFinding}
+            onViewEvidence={(evidence, itemId) => openPhoto({ remote: { storagePath: evidence.storagePath }, itemId })}
+          />
+        </div>
+        <PhotoOverlays />
       </div>
     );
   }
