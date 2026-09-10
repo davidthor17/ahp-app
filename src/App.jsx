@@ -21,7 +21,7 @@ import {
   SYNC, createQueue, queueWrite, clearWrite, pendingCount as queuedCount,
   pendingEntries, resolveSyncState, syncLabel, applyPending,
   sendableEntries, blockedCount, blockedReasons, blockedMessage,
-  markFailure, isPermanentError, withTimeout,
+  markFailure, isPermanentError, withTimeout, isTimeoutError,
 } from "./framework/syncQueue.js";
 import {
   UPDATE_STATE, updateBannerState, updateBannerText, buildAgeDays,
@@ -36,12 +36,23 @@ import {
   PHOTO_STATUS, photoKey, photoButtonLabel, canDelete as canDeletePhoto,
   canRetry, afterUpload, deleteOutcome, deleteMessage, photoIsGoneFromAudit,
   hasUnsavedPhotos, unloadWarning, validateFile, normalisePhotoNote, canEditNote, PHOTO_NOTE_MAX,
+  countSaved as countSavedPhotos, totalUnsaved as totalUnsavedPhotos,
 } from "./framework/photoEvidence.js";
 import { resizeImage, uploadPhoto, deletePhoto, loadPhotos, signedUrl, updatePhotoNote } from "./photoUpload.js";
 import {
   ITEM_STATE, NOT_ASSESSED_REASON, itemStateAcrossShifts, tallyStates,
   progressLabel, allFinal, normaliseNaNote, NA_NOTE_SUGGESTIONS, NA_NOTE_MAX,
 } from "./framework/assessmentState.js";
+import {
+  AUDIT_STATE, ACTION, auditCompletion, canFinish, finishBlocker,
+  primaryAction, nextIncompleteSection, sectionAfter,
+  sectionsNeedingAttention, sectionAttentionNote,
+} from "./framework/auditCompletion.js";
+import {
+  PUBLISH_STATE, PUBLISH_TIMEOUT_MS, publishBlockers, canPublish,
+  blockerMessage, canStartPublish, afterPublish, publishFailureMessage,
+  publishButtonLabel,
+} from "./framework/publishSafety.js";
 
 // Stamped at build time by vite.config.js. Undefined under node --test, where
 // nothing reads it.
@@ -250,7 +261,10 @@ export default function AHPAudit() {
   }, []);
   const [summaryDraft, setSummaryDraft]   = useState('');
   const [auditTier, setAuditTier]         = useState('full'); // desk | spot | full
-  const [publishState, setPublishState]   = useState('idle'); // idle | saving | done | error
+  const [publishState, setPublishState]   = useState(PUBLISH_STATE.IDLE);
+  // React applies the disabled attribute on the next render, so two taps
+  // inside one frame both fire. This ref is the guard the second tap sees.
+  const publishingRef                     = useRef(false);
   // Why a publish failed, so the message can say something useful. A missing
   // column is not a connection problem and retrying will not help.
   const [publishReason, setPublishReason] = useState(null);
@@ -1134,8 +1148,14 @@ export default function AHPAudit() {
     try {
       // The date of the stay lives on the audit row, not in local state. Read
       // it before building so the payload can carry it rather than guessing.
-      const { data: row, error: readErr } = await supabase
-        .from('audits').select('date').eq('id', ids.auditId).single();
+      // Bounded, like every other write since Phase 6.1. Without this a hung
+      // request left publishState at 'saving', the button disabled itself
+      // forever, and the auditor was trapped in PUBLISHING with no way out but
+      // a reload. This is the one place where being stuck is irreversible.
+      const { data: row, error: readErr } = await withTimeout(
+        () => supabase.from('audits').select('date').eq('id', ids.auditId).single(),
+        { timeoutMs: PUBLISH_TIMEOUT_MS },
+      );
       if (readErr) throw readErr;
 
       // One timestamp for this publication, used everywhere in the payload.
@@ -1154,22 +1174,30 @@ export default function AHPAudit() {
         return { ok: false, reason: 'invalid-payload', details: problems };
       }
 
-      const { error } = await supabase.from('audits').update({
-        status: 'published',
-        auditor_summary: summary,
-        critical_failures: failures,
-        tier,
-        published_result: payload,
-      }).eq('id', ids.auditId);
+      const { error } = await withTimeout(
+        () => supabase.from('audits').update({
+          status: 'published',
+          auditor_summary: summary,
+          critical_failures: failures,
+          tier,
+          published_result: payload,
+        }).eq('id', ids.auditId),
+        { timeoutMs: PUBLISH_TIMEOUT_MS },
+      );
       if (error) throw error;
       setSyncState('synced');
-      return { ok: true };
+      // serverConfirmed is what lets the UI say "published" honestly. Nothing
+      // downstream may claim it without this.
+      return { ok: true, serverConfirmed: true };
     } catch (e) {
       setSyncState('error');
-      // The column is added by migrations/2026-08-30-phase55-published-result.sql,
-      // which is not applied. Until it is, this is the error publishing returns,
-      // and it is reported rather than swallowed: publishing without the payload
-      // would quietly produce exactly the live-query report this phase removes.
+      // A timeout is its own outcome, not a generic error: nothing was
+      // written, and the auditor is told exactly that rather than being left
+      // to guess whether half of it went through.
+      if (isTimeoutError(e)) return { ok: false, timedOut: true, reason: 'timeout' };
+      // The column is added by migrations/2026-08-30-phase55-published-result.sql.
+      // Reported rather than swallowed: publishing without the payload would
+      // quietly produce exactly the live-query report Phase 5.5 removed.
       const missingColumn = e && (e.code === '42703' || e.code === 'PGRST204'
         || /published_result/.test(e.message || ''));
       return { ok: false, reason: missingColumn ? 'schema-missing' : 'error' };
@@ -1225,6 +1253,25 @@ export default function AHPAudit() {
   };
 
   const shiftIds = shifts.map(s => s.id);
+
+  /**
+   * Where this audit has got to, derived once and shared by every screen.
+   *
+   * The sticky action bar, the finish gate and the completion overview all
+   * read this one value, so they cannot disagree about whether the audit is
+   * finishable. Two sources of truth is how an auditor ends up looking at a
+   * button that will not do what it says.
+   */
+  const completion = useMemo(
+    () => auditCompletion({
+      sections: visibleSections, isApplicable: isItemApplicable,
+      audit, shiftIds, status: reviewMeta ? reviewMeta.status : null,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [visibleSections, isItemApplicable, audit, shifts, reviewMeta],
+  );
+  const nextAction = primaryAction(completion);
+  const finishGate = finishBlocker(completion);
 
   /**
    * How far this section has got, split by what the auditor actually did.
@@ -1318,6 +1365,24 @@ export default function AHPAudit() {
   const syncBadge = syncLabel(effectiveSync, pendingWrites, blockedWrites);
   const SYNC_TONE = { ok: '#4DC87A', busy: C.gold, bad: '#E05555', muted: C.muted };
   const refusedMessage = blockedMessage(blockedInfo);
+
+  // Evidence counts for the completion screen and the publish gate. Saved is
+  // what the server holds; outstanding is what exists only on this device and
+  // must never be published around. Declared before the gate that reads them.
+  const savedPhotoCount = useMemo(
+    () => Object.values(photos).reduce((n, list) => n + countSavedPhotos(list), 0),
+    [photos],
+  );
+  const outstandingPhotoCount = useMemo(() => totalUnsavedPhotos(photos), [photos]);
+
+  // The publish gate, derived from what is actually true. Never a boolean
+  // nobody can read: a list, so the screen can say which reason applies.
+  const publishGate = publishBlockers({
+    hasSession: !!session, readOnly, hasAudit: !!ids.auditId,
+    pendingWrites, blockedWrites, unsavedPhotos: outstandingPhotoCount,
+    needsLegacyAck, legacyAck, publishState,
+  });
+  const publishAllowed = publishGate.length === 0;
 
   // ---------- app updates ----------
   const updateState = updateBannerState({
@@ -1434,6 +1499,54 @@ export default function AHPAudit() {
       )}
     </div>
   );
+
+  /**
+   * The next action, always under the thumb.
+   *
+   * This is the whole of the field fix. FINISH AUDIT was never disabled and
+   * never hidden by state: it sat 885px below the fold on a 375x812 phone,
+   * beneath fifteen section cards, reached from a section screen whose bottom
+   * had no exit at all. An auditor finished a real hotel checklist and could
+   * not find it.
+   *
+   * So it is pinned. One action, never two, derived from the same completion
+   * value the finish gate uses. It sits above the home indicator by way of the
+   * existing safe-area handling, and the scroll padding below already leaves
+   * room for it, so it covers no checklist content.
+   */
+  const ActionBar = ({ onAction }) => {
+    if (readOnly || !nextAction) return null;
+    const ready = nextAction.tone === 'ready';
+    return (
+      <div style={{
+        position: 'sticky', bottom: 0, zIndex: 90,
+        background: 'rgba(12,12,15,0.94)', backdropFilter: 'blur(8px)',
+        borderTop: `1px solid ${ready ? C.goldBorder : C.border}`,
+        padding: `10px 16px calc(10px + env(safe-area-inset-bottom, 0px))`,
+      }}>
+        <button onClick={onAction} style={{
+          width: '100%', minHeight: '52px', padding: '10px 14px', borderRadius: '10px',
+          border: ready ? 'none' : `1px solid ${C.border}`,
+          background: ready ? C.gold : C.surface2,
+          color: ready ? '#0C0C0F' : C.text,
+          fontFamily: 'inherit', cursor: 'pointer',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '2px',
+        }}>
+          <span style={{ fontSize: '13px', fontWeight: '700', letterSpacing: '0.06em' }}>{nextAction.label}</span>
+          <span style={{ fontSize: '11px', fontWeight: '500', opacity: ready ? 0.75 : 0.7 }}>{nextAction.caption}</span>
+        </button>
+      </div>
+    );
+  };
+
+  /** Take the auditor wherever the primary action points. */
+  const runPrimaryAction = useCallback(() => {
+    if (!nextAction) return;
+    if (nextAction.action === ACTION.FINISH) { setScreen('finish'); return; }
+    const target = nextIncompleteSection(completion, activeSection);
+    if (target) { setActiveSection(target.id); setScreen('section'); return; }
+    setScreen('home');
+  }, [nextAction, completion, activeSection]);
 
   /**
    * Writes the server has refused for good.
@@ -2214,12 +2327,23 @@ export default function AHPAudit() {
             SCORING SUMMARY
           </button>
 
-          {!readOnly && (
-            <button onClick={() => setScreen('finish')} style={{ width: '100%', marginTop: '8px', padding: '14px', borderRadius: '10px', border: `1px solid ${C.goldBorder}`, background: 'transparent', color: C.gold, fontSize: '13px', fontWeight: '700', letterSpacing: '0.05em', cursor: 'pointer' }}>
-              FINISH AUDIT →
-            </button>
+          {/* Why finishing is not available yet, and nothing more.
+
+              There is deliberately no inline FINISH button here. The sticky bar
+              already offers it, and rendering both put two identical gold
+              FINISH AUDIT buttons on screen at once at the bottom of a
+              completed audit, which is the confusion this phase exists to
+              remove rather than create. When the audit is finishable the bar
+              is the single call to action; when it is not, this explains
+              exactly what is outstanding, which the bar has no room to say. */}
+          {!readOnly && finishGate.blocked && (
+            <div style={{ marginTop: '14px', padding: '12px 14px', borderRadius: '9px', background: C.surface2, border: `1px solid ${C.border}` }}>
+              <div style={{ fontSize: '12px', fontWeight: '600', color: C.dim, marginBottom: '4px' }}>Not ready to finish</div>
+              <div style={{ fontSize: '12px', color: C.muted, lineHeight: '1.5' }}>{finishGate.message}</div>
+            </div>
           )}
         </div>
+        <ActionBar onAction={runPrimaryAction} />
       </div>
     );
   }
@@ -2271,10 +2395,62 @@ export default function AHPAudit() {
         <UpdateBar />
         <RefusedBar />
         <div style={bodyStyle}>
-          <div style={{ marginBottom: '24px' }}>
-            <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>FINISH & PUBLISH</div>
+          <div style={{ marginBottom: '20px' }}>
+            <div style={{ fontSize: '11px', color: C.gold, letterSpacing: '0.1em', fontWeight: '600', marginBottom: '5px' }}>REVIEW & PUBLISH</div>
             <h1 style={{ fontSize: '19px', fontWeight: '700', margin: 0 }}>{prop.name}</h1>
+            <div style={{ fontSize: '12px', color: C.muted, marginTop: '5px' }}>
+              {prop.category} · {auditTier === 'desk' ? 'Desk Review' : auditTier === 'spot' ? 'Spot Audit' : 'Full Audit'}
+              {ids.auditRef ? ` · ${ids.auditRef}` : ''}
+            </div>
           </div>
+
+          {/* The quality-control checkpoint. What was actually done, in the
+              same vocabulary the scoring engine uses, before the irreversible
+              step. Counts come from the shared completion value, so they can
+              never disagree with the progress the auditor saw on the way in. */}
+          <div style={card({ marginBottom: '14px' })}>
+            <div style={{ fontSize: '11px', color: C.muted, letterSpacing: '0.08em', fontWeight: '600', marginBottom: '10px' }}>AUDIT SUMMARY</div>
+            {[
+              { label: 'Assessed', value: completion.tally.assessed, tone: C.text },
+              { label: 'Missed', value: completion.tally.missed, tone: completion.tally.missed ? '#E05555' : C.text },
+              { label: 'Not assessed', value: completion.tally.notAssessed, tone: C.muted },
+              { label: 'Not available or offered', value: completion.tally.notAvailable, tone: C.muted },
+              { label: 'Still to do', value: completion.tally.pending, tone: completion.tally.pending ? C.warn : C.text },
+              { label: 'Photos', value: savedPhotoCount, tone: C.text },
+            ].map(row => (
+              <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', fontSize: '13px' }}>
+                <span style={{ color: C.dim }}>{row.label}</span>
+                <span style={{ fontWeight: '600', color: row.tone }}>{row.value}</span>
+              </div>
+            ))}
+            {completion.tally.notAssessed > 0 && (
+              <div style={{ marginTop: '10px', fontSize: '11px', color: C.muted, lineHeight: '1.5' }}>
+                Not assessed never counts against the score. It does count against coverage, because those items were not experienced on this stay.
+              </div>
+            )}
+          </div>
+
+          {/* Sections worth a second look. Unfinished first, because those are
+              actionable; then sections finished but largely not experienced,
+              which is information rather than a fault. */}
+          {sectionsNeedingAttention(completion).length > 0 && (
+            <div style={card({ marginBottom: '14px' })}>
+              <div style={{ fontSize: '11px', color: C.muted, letterSpacing: '0.08em', fontWeight: '600', marginBottom: '10px' }}>SECTIONS TO CHECK</div>
+              {sectionsNeedingAttention(completion).map(sec => {
+                const note = sectionAttentionNote(sec);
+                return (
+                  <div key={sec.id}
+                    onClick={() => { setSectionReturn('finish'); setActiveSection(sec.id); setScreen('section'); }}
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', padding: '9px 0', borderTop: `1px solid ${C.border}`, cursor: 'pointer' }}>
+                    <span style={{ fontSize: '13px', fontWeight: '600' }}>{sec.label}</span>
+                    <span style={{ fontSize: '12px', flexShrink: 0, color: note.tone === 'bad' ? C.warn : note.tone === 'ok' ? '#4DC87A' : C.muted }}>
+                      {note.text} ›
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
           <div style={{ marginBottom: '20px' }}>
             <span style={lbl}>Audit Package</span>
@@ -2375,26 +2551,54 @@ export default function AHPAudit() {
             </div>
           )}
 
-          <button disabled={!session || publishState === 'saving' || (needsLegacyAck && !legacyAck)} onClick={async () => {
-            setPublishState('saving');
-            const res = await publishAudit(summaryDraft, auditTier);
-            setPublishReason(res.ok ? null : (res.reason || 'error'));
-            setPublishState(res.ok ? 'done' : 'error');
-          }} style={{ width: '100%', padding: '14px', borderRadius: '10px', border: 'none', background: (session && !(needsLegacyAck && !legacyAck)) ? C.gold : C.surface2, color: (session && !(needsLegacyAck && !legacyAck)) ? '#0C0C0F' : C.muted, fontSize: '14px', fontWeight: '700', letterSpacing: '0.06em', cursor: session ? 'pointer' : 'default' }}>
-            {publishState === 'saving' ? 'PUBLISHING…' : publishState === 'done' ? 'PUBLISHED ✓' : 'PUBLISH AUDIT'}
-          </button>
-          {/* A failed publish says which kind of failure it was. The schema case
-              is not a connection problem and retrying will not fix it. */}
-          {publishState === 'error' && (
-            <div style={{ marginTop: '10px', fontSize: '12px', color: '#E05555', lineHeight: '1.5' }}>
-              {publishReason === 'schema-missing'
-                ? 'This audit was not published. The database cannot yet store a published report, so publishing would produce a report that changes whenever the property record changes. Nothing was written.'
-                : publishReason === 'invalid-payload'
-                  ? 'This audit was not published. The report could not be assembled from what has been recorded. Nothing was written.'
-                  : "Couldn't publish. Check your connection and try again."}
+          {/* Every reason this cannot be published, before the button rather
+              than after a failed attempt. A greyed button with no explanation
+              is what left an auditor guessing. */}
+          {publishGate.length > 0 && (
+            <div style={{ marginBottom: '10px', padding: '11px 13px', borderRadius: '9px', background: C.warnBg, border: '1px solid rgba(245,166,35,0.25)' }}>
+              {publishGate.map(b => (
+                <div key={b.id} style={{ fontSize: '12px', color: C.warn, lineHeight: '1.5', marginBottom: '2px' }}>
+                  {blockerMessage(b)}
+                </div>
+              ))}
             </div>
           )}
-          {publishState === 'done' && (
+
+          <button
+            disabled={!publishAllowed}
+            onClick={async () => {
+              // The ref, not the state, is what makes this single flight.
+              if (publishingRef.current || !canStartPublish(publishState)) return;
+              publishingRef.current = true;
+              setPublishState(PUBLISH_STATE.PUBLISHING);
+              try {
+                const res = await publishAudit(summaryDraft, auditTier);
+                const next = afterPublish(res);
+                setPublishReason(next.reason);
+                // PUBLISHED is set only from a result the server confirmed.
+                setPublishState(next.state);
+              } finally {
+                // Always released, including on a timeout. The lock outliving
+                // the attempt is what trapped the auditor in PUBLISHING.
+                publishingRef.current = false;
+              }
+            }}
+            style={{
+              width: '100%', minHeight: '52px', padding: '14px', borderRadius: '10px', border: 'none',
+              background: publishAllowed ? C.gold : C.surface2,
+              color: publishAllowed ? '#0C0C0F' : C.muted,
+              fontSize: '14px', fontWeight: '700', letterSpacing: '0.06em',
+              cursor: publishAllowed ? 'pointer' : 'default',
+            }}>
+            {publishButtonLabel(publishState)}
+          </button>
+
+          {publishState === PUBLISH_STATE.FAILED && (
+            <div style={{ marginTop: '10px', fontSize: '12px', color: '#E05555', lineHeight: '1.5' }}>
+              {publishFailureMessage(publishReason)}
+            </div>
+          )}
+          {publishState === PUBLISH_STATE.PUBLISHED && (
             <div style={{ marginTop: '14px' }}>
               <div style={{ fontSize: '12px', color: '#4DC87A', marginBottom: '8px' }}>This audit is now live for {prop.name}.</div>
               {ids.auditRef && (
@@ -2658,7 +2862,40 @@ export default function AHPAudit() {
               </div>
             );
           })}
+
+          {/* The end of a section used to be a cul-de-sac: the last item, then
+              nothing, with the only exit a small glyph diagonally opposite in
+              the header. This hands the auditor forward instead. */}
+          {!readOnly && (() => {
+            const here = completion.bySection.find(s => s.id === section.id);
+            const onward = nextIncompleteSection(completion, section.id) || sectionAfter(completion, section.id);
+            return (
+              <div style={card({ marginTop: '18px', textAlign: 'center' })}>
+                <div style={{ fontSize: '13px', fontWeight: '600', marginBottom: '4px' }}>
+                  {here && here.complete ? `${section.label} complete` : `${section.label}`}
+                </div>
+                <div style={{ fontSize: '12px', color: C.dim, marginBottom: '14px' }}>
+                  {here ? here.summary : ''}
+                </div>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button onClick={leaveSection} style={{
+                    flex: 1, minHeight: '44px', borderRadius: '9px', border: `1px solid ${C.border}`,
+                    background: 'transparent', color: C.dim, fontSize: '12px', fontWeight: '600',
+                    cursor: 'pointer', fontFamily: 'inherit',
+                  }}>ALL SECTIONS</button>
+                  {onward && (
+                    <button onClick={() => { setFocusItemId(null); setActiveSection(onward.id); window.scrollTo(0, 0); }} style={{
+                      flex: 1, minHeight: '44px', borderRadius: '9px', border: `1px solid ${C.goldBorder}`,
+                      background: 'transparent', color: C.gold, fontSize: '12px', fontWeight: '700',
+                      cursor: 'pointer', fontFamily: 'inherit',
+                    }}>NEXT SECTION →</button>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
         </div>
+        <ActionBar onAction={runPrimaryAction} />
       </div>
     );
   }
