@@ -3,12 +3,14 @@ import { createClient } from "@supabase/supabase-js";
 import { SECTIONS } from "./auditItems.js";
 import AuditSummary from "./AuditSummary.jsx";
 import AuditIntelligencePanel from "./AuditIntelligencePanel.jsx";
+import ExecutiveReport from "./ExecutiveReport.jsx";
 // Framework v1 scoring. Imported from the leaf modules rather than index.js so
 // no top-level await reaches the bundle. Runs alongside the legacy score in
 // Phase 2; it does not replace it, and nothing it produces is persisted.
 import { score as frameworkScore } from "./framework/scoring.js";
 import { certify as frameworkCertify } from "./framework/certification.js";
 import { analyzeAuditIntelligence } from "./framework/auditIntelligence.js";
+import { buildExecutiveReport } from "./framework/executiveReport.js";
 import { NA_REASON } from "./framework/weights.js";
 import {
   buildSnapshot, resolveScoringProfile, classifyLoadedAudit, canFreeze,
@@ -1474,6 +1476,18 @@ export default function AHPAudit() {
     [frameworkResult, audit, scoringBasis],
   );
 
+  // Phase 6.6. Reduces auditIntelligence further for a reader who will
+  // never open the checklist — a headline and capped top-N lists, not a
+  // second ranking of raw findings. Same inputs as auditIntelligence, plus
+  // certification for the one fact it needs from it (a level actually
+  // earned, never a level missed).
+  const executiveReport = useMemo(
+    () => buildExecutiveReport({
+      scoreResult: frameworkResult, intelligence: auditIntelligence, certification: frameworkCertification,
+    }),
+    [frameworkResult, auditIntelligence, frameworkCertification],
+  );
+
   // Does publishing this audit need the legacy acknowledgement?
   //
   // Only an audit that has actually recorded something and has no readable
@@ -2604,6 +2618,12 @@ export default function AHPAudit() {
             </div>
             {auditTier === 'desk' && <div style={{ fontSize: '11px', color: C.muted, marginTop: '8px' }}>Desk reviews are internal only — no public seal is issued, regardless of score.</div>}
           </div>
+
+          {/* Phase 6.6. The big picture, before any of the detail below it —
+              a General Manager reads this and stops, an auditor keeps
+              scrolling into AuditSummary and AuditIntelligencePanel for the
+              checklist-level detail this deliberately does not repeat. */}
+          <ExecutiveReport report={executiveReport} palette={C} onOpenFinding={openFinding} />
 
           {/* Framework v1. Display only: nothing below is written on publish. */}
           <AuditSummary
