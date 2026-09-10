@@ -2,11 +2,13 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { createClient } from "@supabase/supabase-js";
 import { SECTIONS } from "./auditItems.js";
 import AuditSummary from "./AuditSummary.jsx";
+import AuditIntelligencePanel from "./AuditIntelligencePanel.jsx";
 // Framework v1 scoring. Imported from the leaf modules rather than index.js so
 // no top-level await reaches the bundle. Runs alongside the legacy score in
 // Phase 2; it does not replace it, and nothing it produces is persisted.
 import { score as frameworkScore } from "./framework/scoring.js";
 import { certify as frameworkCertify } from "./framework/certification.js";
+import { analyzeAuditIntelligence } from "./framework/auditIntelligence.js";
 import { NA_REASON } from "./framework/weights.js";
 import {
   buildSnapshot, resolveScoringProfile, classifyLoadedAudit, canFreeze,
@@ -1458,6 +1460,20 @@ export default function AHPAudit() {
     [frameworkResult, auditTier, scoringBasis],
   );
 
+  // Phase 6.5. Aggregates the findings frameworkResult already derived into
+  // priorities, strengths and patterns — nothing here re-scores or
+  // re-derives a finding. Same inputs as frameworkResult, so the two can
+  // never read two different audits.
+  const auditIntelligence = useMemo(
+    () => analyzeAuditIntelligence({
+      scoreResult: frameworkResult,
+      audit,
+      profile: scoringBasis.profile,
+      options: { scopeSections: scoringBasis.scopeSections, checklistItems: scoringBasis.checklistItems },
+    }),
+    [frameworkResult, audit, scoringBasis],
+  );
+
   // Does publishing this audit need the legacy acknowledgement?
   //
   // Only an audit that has actually recorded something and has no readable
@@ -2597,6 +2613,12 @@ export default function AHPAudit() {
             palette={C}
             onOpenFinding={openFinding}
           />
+
+          {/* Phase 6.5. What AuditSummary above does not already show: a ranked
+              view of what to address first, and — new to this console — what
+              the property genuinely got right. Compact by design; every
+              finding itself is already listed above. */}
+          <AuditIntelligencePanel intelligence={auditIntelligence} palette={C} onOpenFinding={openFinding} />
 
           {/* Legacy scoring. Still the number that publishAudit() writes and the
               published report renders, so it stays visible and is labelled. */}
