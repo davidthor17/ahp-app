@@ -67,7 +67,11 @@ export function buildHeadline({ overall, band, zeroToleranceCount, criticalCount
   const label = BAND_LABEL[band];
 
   if (zeroToleranceCount > 0) {
-    return `${label} overall performance with a critical operational risk${zeroToleranceCount > 1 ? 's' : ''} recorded`;
+    // The article has to move with the number. "a critical operational risks"
+    // was internal-only copy until Phase 6.8 began publishing this line.
+    return zeroToleranceCount > 1
+      ? `${label} overall performance with critical operational risks recorded`
+      : `${label} overall performance with a critical operational risk recorded`;
   }
   if (criticalCount > 0) {
     return `${label} overall performance with critical issues requiring attention`;

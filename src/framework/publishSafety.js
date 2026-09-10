@@ -157,7 +157,12 @@ export function afterPublish({ ok = false, timedOut = false, reason = null } = {
       retryable: true,
     };
   }
-  return { state: PUBLISH_STATE.FAILED, reason: reason || 'error', retryable: reason !== 'schema-missing' };
+  // schema-missing and already-published are both settled answers rather than
+  // bad luck: retrying changes neither. already-published is the stronger of
+  // the two, because trying again is not merely useless but is the exact thing
+  // the publish-once condition exists to refuse.
+  const settled = reason === 'schema-missing' || reason === 'already-published';
+  return { state: PUBLISH_STATE.FAILED, reason: reason || 'error', retryable: !settled };
 }
 
 /** What a failed publish tells the auditor. Never raw database vocabulary. */
@@ -167,6 +172,8 @@ export function publishFailureMessage(reason) {
       return 'Publishing took too long and was stopped. Nothing was published. Your audit is safe on this device, and you can try again.';
     case 'schema-missing':
       return 'This audit was not published. Specula cannot store a published report yet. Nothing was written, and trying again will not help until that is fixed.';
+    case 'already-published':
+      return 'This audit has already been published. Its report was issued as it stood then and cannot be replaced, so nothing was written.';
     case 'invalid-payload':
       return 'This audit was not published. The report could not be assembled from what has been recorded. Nothing was written.';
     case 'no-audit':

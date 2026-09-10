@@ -15,6 +15,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   PUBLISH_STATE, PUBLISH_TIMEOUT_MS, BLOCKER,
@@ -229,4 +232,53 @@ test('a hung publish recovers and the second attempt succeeds', () => {
   state = afterPublish({ ok: true }).state;
   assert.equal(state, PUBLISH_STATE.PUBLISHED);
   assert.equal(canStartPublish(state), false, 'and cannot be published again');
+});
+
+// ── Phase 6.8: publish once, and only once ─────────────────────────────────
+//
+// The gate above is about whether an audit is ready. This is about whether it
+// has already happened. Publishing was idempotent in the worst sense: the
+// update matched on id alone, so a second publish of the same audit silently
+// replaced a report that had already been issued with one recomputed from
+// whatever the audit held today. The condition that stops it lives in the
+// statement itself rather than in a check beside it, because a check and a
+// write in two statements is a window a second tab can climb through.
+
+test('an already-published audit is a settled answer, not bad luck', () => {
+  const next = afterPublish({ ok: false, reason: 'already-published' });
+  assert.equal(next.state, PUBLISH_STATE.FAILED);
+  assert.equal(next.reason, 'already-published');
+  assert.equal(next.retryable, false, 'retrying is the exact thing being refused');
+
+  const message = publishFailureMessage('already-published');
+  assert.match(message, /already been published/);
+  assert.match(message, /nothing was written/i, 'the auditor is told the report is untouched');
+  assert.equal(/error|failed|Postgres|supabase/i.test(message), false, 'and never in database vocabulary');
+});
+
+test('the publish update carries its own publish-once condition', () => {
+  // Read from source, the way migration-safety.test.js reads the SQL. The
+  // guarantee is a property of the statement that is sent, so nothing short of
+  // looking at that statement can prove it is still there.
+  const app = readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src/App.jsx'),
+    'utf8',
+  );
+  const update = app.slice(app.indexOf("supabase.from('audits').update({"));
+  const statement = update.slice(0, update.indexOf('{ timeoutMs'));
+
+  assert.match(statement, /published_result: payload/, 'this is the publish statement');
+  assert.match(
+    statement,
+    /\.or\(\s*'status\.neq\.published,published_result\.is\.null'\s*\)/,
+    'the update must refuse a row that is already published and already carries a payload',
+  );
+  assert.match(statement, /\.select\('id'\)/, 'and must ask which rows it actually wrote');
+  // A row count is only meaningful if nothing was written when it is zero, so
+  // the caller has to treat an empty result as a refusal rather than a success.
+  assert.match(
+    app.slice(app.indexOf('.select(\'id\')')),
+    /written\.length === 0[\s\S]{0,240}already-published/,
+    'an empty result must be reported as already-published, never as success',
+  );
 });

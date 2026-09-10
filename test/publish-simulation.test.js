@@ -59,7 +59,7 @@ test('the console would publish a payload that validates', () => {
 
 test('the payload records what was actually found', () => {
   const p = publish();
-  assert.equal(p.formatVersion, 1);
+  assert.equal(p.formatVersion, 2);
   assert.equal(p.auditType, 'full');
   assert.equal(p.property.name, 'Flag Test Hotel');
   assert.equal(p.property.category, '5★');

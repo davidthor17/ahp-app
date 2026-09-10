@@ -1291,6 +1291,10 @@ export default function AHPAudit() {
       const payload = buildPublishedResult({
         prop, graded: audit, auditType: tier, criticalFailures: failures,
         scoringBasis, auditedOn: row ? row.date : null, publishedAt, summary,
+        // Phase 6.8. The curated intelligence block, frozen in the same call
+        // from the same render's memos, so the payload can never mix an
+        // executive read of one audit state with a score from another.
+        intelligence: auditIntelligence, executiveReport,
       });
 
       // A payload that would not render must never reach the database. Failing
@@ -1302,17 +1306,41 @@ export default function AHPAudit() {
         return { ok: false, reason: 'invalid-payload', details: problems };
       }
 
-      const { error } = await withTimeout(
+      // Publish once, and only once.
+      //
+      // The condition is the guarantee, not the button: a published report is a
+      // document that was issued, so nothing may recompute it later from data
+      // that has moved on since. Written as a filter rather than a read-then-
+      // write because a check in one statement and a write in another is two
+      // statements a second tab can slip between; Postgres evaluates this one
+      // against the row it is about to lock.
+      //
+      // Read it as: this audit, unless it is already published AND already
+      // carries a payload. An audit published before payloads existed still has
+      // none, so it stays publishable rather than being frozen out of the
+      // contract by a rule written after it; a NULL status, which `neq` alone
+      // would silently exclude, is caught by the second arm.
+      const { data: written, error } = await withTimeout(
         () => supabase.from('audits').update({
           status: 'published',
           auditor_summary: summary,
           critical_failures: failures,
           tier,
           published_result: payload,
-        }).eq('id', ids.auditId),
+        })
+          .eq('id', ids.auditId)
+          .or('status.neq.published,published_result.is.null')
+          .select('id'),
         { timeoutMs: PUBLISH_TIMEOUT_MS },
       );
       if (error) throw error;
+      // No row matched, so nothing was written. The existing report stands
+      // exactly as it was issued, and saying so is the honest outcome: this is
+      // not a failure to retry.
+      if (!written || written.length === 0) {
+        setSyncState('synced');
+        return { ok: false, reason: 'already-published' };
+      }
       setSyncState('synced');
       // serverConfirmed is what lets the UI say "published" honestly. Nothing
       // downstream may claim it without this.

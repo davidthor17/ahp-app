@@ -213,12 +213,16 @@ test('the payload is deterministic: same input, identical output', () => {
 });
 
 test('the payload holds no framework certification data', () => {
+  // Built without intelligence inputs, which is the base contract: everything
+  // Phase 6.8 added is opt-in, and none of it may appear when it was not asked
+  // for. The version 2 equivalent of this test lives in
+  // published-intelligence.test.js and has its own, longer forbidden list.
   const payload = buildPublishedResult(baseInput());
   const flat = JSON.stringify(payload);
   for (const leak of [
     'certif', 'foundation', 'distinction', 'coverage', 'weightClass', 'dimension',
     'findings', 'severity', 'frameworkVersion', 'checklistVersion', 'facilityProfile',
-    'scopeSections', 'elite', 'exceptional',
+    'scopeSections', 'elite', 'exceptional', 'intelligence',
   ]) {
     assert.equal(flat.toLowerCase().includes(leak.toLowerCase()), false, `${leak} must not reach the public payload`);
   }
@@ -283,7 +287,8 @@ test('validation rejects everything a reader could not render', () => {
     ['null', null],
     ['a string', 'nope'],
     ['an array', []],
-    ['a future version', { ...good, formatVersion: 2 }],
+    ['a future version', { ...good, formatVersion: 3 }],
+    ['a version before the contract', { ...good, formatVersion: 0 }],
     ['no version', { ...good, formatVersion: undefined }],
     ['an unknown audit type', { ...good, auditType: 'mystery' }],
     ['no publishedAt', { ...good, publishedAt: null }],
