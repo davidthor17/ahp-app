@@ -290,3 +290,52 @@ export function canEditNote(photo, { readOnly = false } = {}) {
 /** A caption is only persisted separately once the photo itself exists. */
 export const noteNeedsWrite = (photo) =>
   Boolean(photo && photo.status === PHOTO_STATUS.SAVED && photo.remote && photo.remote.id);
+
+// ── durable caption text (Phase 6.4) ────────────────────────────────────────
+//
+// A caption typed and not yet committed lived only in React state: readable
+// on screen, gone on reload. That is a smaller version of the same defect the
+// item queue has — text the auditor wrote existing nowhere but the tab.
+//
+// The photo itself is explicitly not this phase's problem: the file is a Blob
+// and stays in-memory-only, as documented above. A caption is a few words of
+// text keyed to a photo that already has a server id, which is exactly the
+// kind of small structured write the durable queue already handles for
+// grades. Keyed by the server photo id rather than localId, because localId
+// is only ever known to the tab that created it and would not survive a
+// reload in the first place.
+
+/** Every caption on this device the server does not yet hold, as plain JSON. */
+export function dirtyCaptions(byItem = {}) {
+  const out = [];
+  for (const list of Object.values(byItem)) {
+    for (const p of list || []) {
+      if (p && p.noteDirty && p.remote && p.remote.id) {
+        out.push({ photoId: p.remote.id, note: p.note || null });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Lay restored caption text back over a freshly loaded photo list.
+ *
+ * Runs after loadPhotos, the same place a pending item write is reapplied
+ * over what the server returned: the server's answer is not wrong, it is
+ * just missing what has not reached it yet.
+ */
+export function applyDirtyCaptions(byItem = {}, dirty = []) {
+  if (!Array.isArray(dirty) || dirty.length === 0) return byItem;
+  const byPhotoId = new Map(dirty.map((d) => [d.photoId, d.note]));
+  const out = {};
+  for (const [key, list] of Object.entries(byItem)) {
+    out[key] = (list || []).map((p) => {
+      if (p && p.remote && p.remote.id && byPhotoId.has(p.remote.id)) {
+        return { ...p, note: byPhotoId.get(p.remote.id), noteDirty: true };
+      }
+      return p;
+    });
+  }
+  return out;
+}

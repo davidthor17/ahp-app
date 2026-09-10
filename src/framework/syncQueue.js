@@ -290,3 +290,99 @@ export function withTimeout(run, { timeoutMs = WRITE_TIMEOUT_MS, onTimeout = nul
 
 /** A timeout is transient: the connection was bad, not the row. */
 export const isTimeoutError = (error) => Boolean(error && (error.timeout || error.code === 'TIMEOUT'));
+
+// ── durability (Phase 6.4) ───────────────────────────────────────────────────
+//
+// Everything above this line answers "what is outstanding right now" for an
+// app that is open. None of it survives a reload: pendingRef is a useRef, and
+// a useRef is exactly as durable as the tab. Before this, a refresh with
+// unsaved grades did not just forget they were outstanding — the next remote
+// pull (App.jsx, "once signed in... pull the latest remote copy") reapplies
+// the queue over the server's rows, and reapplying an empty queue reapplies
+// nothing. The grade the auditor made was silently replaced by the server's
+// older copy, with no REFUSED, no error, nothing to see. That is the defect
+// this exists to close.
+//
+// The fix is not a second queue. It is a way to write the one queue above to
+// disk and read it back, so pendingRef can be repopulated before that pull
+// effect ever runs. Everything about retrying, refusing and reporting stays
+// exactly as it already is; only where the Map's contents live between page
+// loads changes.
+
+/** Bump when the durable shape changes. A record from an older version is
+ * never assumed to still mean the same thing — see deserializeQueue. */
+export const QUEUE_STORAGE_VERSION = 1;
+
+/**
+ * The queue, as JSON.
+ *
+ * itemId and shiftId travel with each entry rather than living only in the
+ * Map key, so a key that fails to parse can never separate an entry from the
+ * identity that makes it safe to retry. auditId travels with the envelope,
+ * not each entry: every entry in one queue belongs to whichever audit was
+ * open when it was made, and the caller is the one place that fact is known.
+ */
+export function serializeQueue(queue, auditId) {
+  return {
+    v: QUEUE_STORAGE_VERSION,
+    auditId: auditId || null,
+    savedAt: new Date().toISOString(),
+    entries: pendingEntries(queue).map((e) => ({
+      itemId: e.itemId,
+      shiftId: e.shiftId,
+      patch: e.patch,
+      attempts: e.attempts || 0,
+      error: e.error || null,
+      blocked: !!e.blocked,
+    })),
+  };
+}
+
+/**
+ * Rebuild a queue from its durable shape.
+ *
+ * Defensive per entry, not per envelope. This is the same rule Phase 6.1
+ * already applies to a write the server refuses: one bad record must never be
+ * a reason to lose every good one around it. An envelope this does not
+ * recognise — wrong version, wrong shape, not there at all — restores as an
+ * empty queue rather than throwing, because a durability layer that can crash
+ * the app on its own saved data is worse than not having one.
+ *
+ * Returns what was skipped and why, so a caller can log it. Nothing here
+ * decides that is worth telling the auditor; a queue that came back with one
+ * fewer entry than expected is a diagnostic, not an incident.
+ */
+export function deserializeQueue(raw) {
+  const skipped = [];
+  const queue = createQueue();
+
+  if (!raw || typeof raw !== 'object') {
+    return { queue, auditId: null, skipped };
+  }
+  if (raw.v !== QUEUE_STORAGE_VERSION || !Array.isArray(raw.entries)) {
+    skipped.push({ reason: `unrecognised envelope (v=${raw.v})` });
+    return { queue, auditId: (typeof raw.auditId === 'string' && raw.auditId) || null, skipped };
+  }
+
+  for (const entry of raw.entries) {
+    try {
+      if (!entry || typeof entry !== 'object') throw new Error('entry is not an object');
+      const { itemId, shiftId, patch } = entry;
+      if (typeof itemId !== 'string' || !itemId) throw new Error('missing itemId');
+      if (typeof shiftId !== 'string' || !shiftId) throw new Error('missing shiftId');
+      if (!patch || typeof patch !== 'object') throw new Error('missing patch');
+      queue.set(writeKey(itemId, shiftId), {
+        itemId,
+        shiftId,
+        patch,
+        attempts: Number.isFinite(entry.attempts) ? entry.attempts : 0,
+        error: entry.error && typeof entry.error === 'object' ? entry.error : null,
+        blocked: !!entry.blocked,
+      });
+    } catch (e) {
+      skipped.push({ reason: e.message, entry });
+    }
+  }
+
+  return { queue, auditId: (typeof raw.auditId === 'string' && raw.auditId) || null, skipped };
+}

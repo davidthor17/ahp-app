@@ -22,6 +22,7 @@ import {
   pendingEntries, resolveSyncState, syncLabel, applyPending,
   sendableEntries, blockedCount, blockedReasons, blockedMessage,
   markFailure, isPermanentError, withTimeout, isTimeoutError,
+  serializeQueue, deserializeQueue,
 } from "./framework/syncQueue.js";
 import {
   UPDATE_STATE, updateBannerState, updateBannerText, buildAgeDays,
@@ -37,6 +38,7 @@ import {
   canRetry, afterUpload, deleteOutcome, deleteMessage, photoIsGoneFromAudit,
   hasUnsavedPhotos, unloadWarning, validateFile, normalisePhotoNote, canEditNote, PHOTO_NOTE_MAX,
   countSaved as countSavedPhotos, totalUnsaved as totalUnsavedPhotos,
+  dirtyCaptions, applyDirtyCaptions,
 } from "./framework/photoEvidence.js";
 import { resizeImage, uploadPhoto, deletePhoto, loadPhotos, signedUrl, updatePhotoNote } from "./photoUpload.js";
 import {
@@ -180,6 +182,22 @@ export default function AHPAudit() {
   const [blockedWrites, setBlockedWrites] = useState(0);
   const [blockedInfo, setBlockedInfo]     = useState([]);
   const flushingRef                       = useRef(false);
+  // Phase 6.4. Durable pending writes recovered from a previous session, shown
+  // once so the auditor knows what just happened rather than wondering why the
+  // header did not start at SYNCED. Cleared by itself; never blocks anything.
+  const [restoredNotice, setRestoredNotice] = useState(0); // count restored, 0 = nothing to say
+  useEffect(() => {
+    if (!restoredNotice) return;
+    // A courtesy, not a gate. The queue is already correct the instant it is
+    // restored; this is only what tells the auditor it happened, and it says
+    // so once rather than sitting on screen for the rest of the session.
+    const t = setTimeout(() => setRestoredNotice(0), 6000);
+    return () => clearTimeout(t);
+  }, [restoredNotice]);
+  // Caption text recovered from localStorage that has not yet reached the
+  // server. Held until loadPhotos returns something to lay it over — applying
+  // it before then would have nothing to attach it to.
+  const pendingCaptionsRef                = useRef([]);
   // A new build is downloaded and waiting. Never acted on automatically.
   const [needRefresh, setNeedRefresh]     = useState(false);
   const applyUpdateRef                    = useRef(null);
@@ -193,6 +211,20 @@ export default function AHPAudit() {
   const [photoNotice, setPhotoNotice]     = useState(null);
   const photosRef                         = useRef({});
   useEffect(() => { photosRef.current = photos; }, [photos]);
+  // Phase 6.4. A caption is a few words of text keyed to a photo that already
+  // has a server id — small enough to durable the same way a grade is, even
+  // though the photo it belongs to stays in-memory-only. Read-modify-write, so
+  // this can never be the write that makes the pending queue or the cached
+  // audit disappear because it ran without them.
+  useEffect(() => {
+    const dirty = dirtyCaptions(photos);
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const data = raw ? JSON.parse(raw) : {};
+      if (dirty.length) data.pendingCaptions = dirty; else delete data.pendingCaptions;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {}
+  }, [photos]);
   const [ids, setIds]                     = useState({ propertyId: null, auditId: null, auditRef: null });
   const [prop, setProp]                   = useState({
     name: '', city: '', country: '', chain: false, chainName: '',
@@ -560,6 +592,40 @@ export default function AHPAudit() {
           // without one were recorded before any basis was, and adoptAudit
           // marks the audit legacy so the first-grade lock leaves it alone.
           adoptAudit(data.audit, data.snapshot);
+          // Phase 6.4. Restore before anything else touches pendingRef: the
+          // remote-pull effect right below this one reapplies whatever is in
+          // it over the server's rows, and it reapplies nothing if it runs
+          // first and finds the queue empty. Both state updates land in this
+          // same synchronous pass, so the screen that is about to render
+          // already carries the true count — nothing here can flash SYNCED
+          // and correct itself a frame later.
+          //
+          // The auditId check is the isolation guarantee. In today's UI it is
+          // always true — resumeAudit already refuses to open a different
+          // audit while this one has pending work — but the check is what
+          // makes that true by construction here too, rather than by relying
+          // on a guard elsewhere never changing.
+          const restored = deserializeQueue(data.pendingQueue);
+          const cachedAuditId = data.ids && data.ids.auditId;
+          if (restored.skipped.length) {
+            // Diagnosable, never fatal: one unreadable entry must not cost
+            // the rest of the queue, and must not be a reason to tell the
+            // auditor anything alarming about grades that are fine.
+            console.warn('[Specula] durable queue: skipped entries', restored.skipped);
+          }
+          if (restored.auditId && cachedAuditId && restored.auditId === cachedAuditId) {
+            const restoredCount = queuedCount(restored.queue);
+            if (restoredCount > 0) {
+              pendingRef.current = restored.queue;
+              setPendingWrites(restoredCount);
+              setBlockedWrites(blockedCount(restored.queue));
+              setBlockedInfo(blockedReasons(restored.queue));
+              setRestoredNotice(restoredCount);
+            }
+          }
+          if (Array.isArray(data.pendingCaptions) && data.pendingCaptions.length) {
+            pendingCaptionsRef.current = data.pendingCaptions;
+          }
           if (data.trailQueue) setTrailQueue(data.trailQueue);
           // Only a tier this app recognises. A missing one means the audit
           // predates tier persistence, and Full is what it was scored as.
@@ -652,7 +718,35 @@ export default function AHPAudit() {
     // reload, and publishAudit writes whatever it holds to the row: a Spot
     // Audit resumed after a reload would be published as a Full Audit and
     // become eligible for the Mark it must never carry.
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ prop: p, audit: a, ids: i, snapshot: snapshotRef.current, trailQueue: trailRef.current, auditTier: auditTierRef.current })); } catch(e) {}
+    //
+    // pendingQueue travels too, as of Phase 6.4, read fresh from the ref every
+    // time this runs rather than passed in: a caller mid-edit already has the
+    // newest grade in `a`, and the queue is what proves it also reached the
+    // outstanding-writes list, not just the screen.
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        prop: p, audit: a, ids: i, snapshot: snapshotRef.current,
+        trailQueue: trailRef.current, auditTier: auditTierRef.current,
+        pendingQueue: serializeQueue(pendingRef.current, i && i.auditId),
+      }));
+    } catch(e) {}
+  }, []);
+
+  /**
+   * Persist only the queue, without prop/audit/ids in hand.
+   *
+   * flushPending and pushItem are the two places pendingRef actually changes,
+   * and neither holds a fresh copy of the rest of the cache. Read-modify-write
+   * rather than persist()'s full replace, so this can never be the call that
+   * makes a durable grade disappear because it ran without one.
+   */
+  const persistQueue = useCallback((auditId) => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const data = raw ? JSON.parse(raw) : {};
+      data.pendingQueue = serializeQueue(pendingRef.current, auditId);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {}
   }, []);
 
   // Changing the tier is a change to the audit, and it is usually the last
@@ -776,6 +870,12 @@ export default function AHPAudit() {
       setBlockedWrites(blockedCount(pendingRef.current));
       setBlockedInfo(blockedReasons(pendingRef.current));
       setSyncState(transientFailure ? 'error' : 'synced');
+      // A write that just succeeded must stop being durable the same way it
+      // stops being pending: because the server took it, not because the tab
+      // is still open. A write that was just refused must become durable as
+      // REFUSED for the same reason. Both happen here, the one place a flush
+      // ends, so this is never behind what the header is about to say.
+      persistQueue(auditId);
     }
   }, [session, readOnly]);
 
@@ -791,6 +891,11 @@ export default function AHPAudit() {
     if (!ITEM_INDEX[itemId]) return;
     queueWrite(pendingRef.current, itemId, shiftId, patch);
     setPendingWrites(queuedCount(pendingRef.current));
+    // Durable the instant it is queued, before anything is attempted. This is
+    // the Phase 6.4 rule applied at its one load-bearing point: a grade is
+    // outstanding-on-disk before it is outstanding-on-the-wire, so a reload
+    // between this line and the write actually being sent still has it.
+    persistQueue(auditId);
     // No session or no audit row yet: it stays queued and the header says so.
     // The flush effect picks it up when either arrives.
     if (!session || !auditId) return;
@@ -998,8 +1103,19 @@ export default function AHPAudit() {
             remote: { id: r.id, storagePath: r.storage_path, createdAt: r.created_at },
           });
         }
+        // Phase 6.4. A caption typed before a reload and not yet committed is
+        // laid back over the rows the server just returned, the same
+        // principle as applyPending for a grade: the server's answer is not
+        // wrong, it is only missing what has not reached it yet. Taken once —
+        // cleared immediately so a later re-run of this effect (a different
+        // audit opened, session restored again) can never apply a caption
+        // meant for one audit's evidence to another's.
+        const withCaptions = pendingCaptionsRef.current.length
+          ? applyDirtyCaptions(next, pendingCaptionsRef.current)
+          : next;
+        pendingCaptionsRef.current = [];
         setPhotos(prev => {
-          const merged = { ...next };
+          const merged = { ...withCaptions };
           for (const [key, list] of Object.entries(prev)) {
             const unsaved = list.filter(p => p.status !== PHOTO_STATUS.SAVED);
             if (unsaved.length) merged[key] = [...(merged[key] || []), ...unsaved];
@@ -2228,6 +2344,16 @@ export default function AHPAudit() {
             <span style={{ fontSize: '11px', fontWeight: '700', letterSpacing: '0.06em', color: SYNC_TONE[syncBadge.tone] || C.muted }}>
               {syncBadge.text}
             </span>
+            {restoredNotice > 0 && (
+              // Phase 6.4. Said once, calmly, and never in place of the real
+              // state above it: syncBadge already reads UNSAVED/REFUSED
+              // correctly the instant this renders, because the restore ran
+              // before the screen did. This only explains why it did not
+              // start at SYNCED.
+              <span style={{ fontSize: '11px', color: C.gold }}>
+                Restoring {restoredNotice} unsaved change{restoredNotice === 1 ? '' : 's'} saved on this device…
+              </span>
+            )}
             {readOnly ? (
               <button onClick={closeReviewAudit} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>All audits</button>
             ) : (
