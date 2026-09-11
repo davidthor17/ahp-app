@@ -183,6 +183,55 @@ export function publishFailureMessage(reason) {
   }
 }
 
+// ── Phase 7.1: what the server says has already happened ───────────────────
+//
+// publishState is this session's memory of an attempt. It is not a fact about
+// the audit: reload the page and it is IDLE again, and the console offered
+// PUBLISH on an audit that had been published an hour earlier. The database
+// refused that second publish, correctly, but the console should never have
+// offered it. These read the row instead, so the screen says what is true.
+
+/**
+ * The publication on record for an audit row, from its status and payload.
+ * percent is the frozen public figure, or null when the audit was published
+ * before payloads existed and its public report is still derived from items.
+ */
+export function serverPublication(row) {
+  if (!row || row.status !== 'published') return { published: false, publishedAt: null, percent: null };
+  const pr = row.published_result && typeof row.published_result === 'object' && !Array.isArray(row.published_result)
+    ? row.published_result : null;
+  const percent = pr && pr.score && Number.isFinite(pr.score.percent) ? pr.score.percent : null;
+  return { published: true, publishedAt: (pr && typeof pr.publishedAt === 'string' && pr.publishedAt) || null, percent };
+}
+
+/** The state the screen shows: PUBLISHED whenever the server says so, whatever this session remembers. */
+export function effectivePublishState(localState, publication) {
+  if (publication && publication.published) return PUBLISH_STATE.PUBLISHED;
+  return localState;
+}
+
+/**
+ * The two figures an auditor may see after publishing, kept apart.
+ *
+ * frozenPercent is what the public report says and always will; livePercent is
+ * what the audit's grades add up to now. They diverge the moment an item is
+ * changed after publication, which the database allows, and the console must
+ * never present the second as if it were the first.
+ */
+export function scoreDisplay({ publication = null, livePercent = null } = {}) {
+  if (publication && publication.published) {
+    const frozenPercent = Number.isFinite(publication.percent) ? publication.percent : null;
+    return {
+      mode: 'published',
+      frozenPercent,
+      livePercent,
+      legacy: frozenPercent === null,
+      diverged: frozenPercent !== null && livePercent !== null && frozenPercent !== livePercent,
+    };
+  }
+  return { mode: 'unpublished', frozenPercent: null, livePercent, legacy: false, diverged: false };
+}
+
 /** The label on the button, derived rather than assigned. */
 export function publishButtonLabel(publishState) {
   switch (publishState) {

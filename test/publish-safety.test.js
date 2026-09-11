@@ -282,3 +282,69 @@ test('the publish update carries its own publish-once condition', () => {
     'an empty result must be reported as already-published, never as success',
   );
 });
+
+// ── Phase 7.1: the console follows the row, not this session's memory ──────
+//
+// Phase 7.0 reloaded a published audit and the console offered PUBLISH again.
+// The database refused, correctly, but the screen should never have asked. It
+// also labelled the live, still-moving score "currently published" while the
+// public report showed the frozen one. These hold both fixed.
+
+import {
+  serverPublication, effectivePublishState, scoreDisplay,
+} from '../src/framework/publishSafety.js';
+
+const V2_ROW = { status: 'published', published_result: { formatVersion: 2, publishedAt: '2026-09-11T12:21:40.873Z', score: { percent: 76, itemsMet: 41, itemsGraded: 54 } } };
+
+test('the publication on record is read from the row', () => {
+  assert.deepEqual(serverPublication(V2_ROW), { published: true, publishedAt: '2026-09-11T12:21:40.873Z', percent: 76 });
+  assert.deepEqual(serverPublication({ status: 'published', published_result: null }), { published: true, publishedAt: null, percent: null },
+    'a legacy report is published, with no frozen figure');
+  assert.deepEqual(serverPublication({ status: 'draft', published_result: null }), { published: false, publishedAt: null, percent: null });
+  assert.equal(serverPublication(null).published, false);
+  assert.equal(serverPublication({ status: 'published', published_result: 'garbage' }).percent, null, 'a malformed payload yields no figure, not a crash');
+});
+
+test('a published row wins over whatever this session remembers', () => {
+  const pub = serverPublication(V2_ROW);
+  for (const local of [PUBLISH_STATE.IDLE, PUBLISH_STATE.FAILED, PUBLISH_STATE.PUBLISHING]) {
+    assert.equal(effectivePublishState(local, pub), PUBLISH_STATE.PUBLISHED, `${local} after a reload is still PUBLISHED`);
+  }
+  assert.equal(effectivePublishState(PUBLISH_STATE.IDLE, serverPublication({ status: 'draft' })), PUBLISH_STATE.IDLE);
+  assert.equal(effectivePublishState(PUBLISH_STATE.IDLE, null), PUBLISH_STATE.IDLE);
+});
+
+test('an already-published audit is never offered a publish action, even after a reload', () => {
+  const shown = effectivePublishState(PUBLISH_STATE.IDLE, serverPublication(V2_ROW));
+  const gate = publishBlockers(ready({ publishState: shown }));
+  assert.equal(gate[0].id, BLOCKER.ALREADY_PUBLISHED);
+  assert.equal(canPublish(ready({ publishState: shown })), false);
+  assert.equal(canStartPublish(shown), false);
+  assert.equal(publishButtonLabel(shown), 'PUBLISHED ✓');
+});
+
+test('the frozen published figure and the live figure are kept apart', () => {
+  const pub = serverPublication(V2_ROW);
+  assert.deepEqual(scoreDisplay({ publication: pub, livePercent: 72 }),
+    { mode: 'published', frozenPercent: 76, livePercent: 72, legacy: false, diverged: true },
+    'the Phase 7.0 case: an item changed after publishing moved the live figure only');
+  assert.equal(scoreDisplay({ publication: pub, livePercent: 76 }).diverged, false);
+  assert.deepEqual(scoreDisplay({ publication: serverPublication({ status: 'published', published_result: null }), livePercent: 58 }),
+    { mode: 'published', frozenPercent: null, livePercent: 58, legacy: true, diverged: false },
+    'a legacy report has no frozen figure, and says so rather than inventing one');
+  assert.equal(scoreDisplay({ publication: null, livePercent: 80 }).mode, 'unpublished');
+});
+
+test('the console reads the publication in both load paths and drops the stale copy', () => {
+  const app = readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src/App.jsx'), 'utf8');
+  assert.equal((app.match(/snapshot_locked_at, status, published_result'\)/g) || []).length, 2,
+    'resume and the remote pull both read status and published_result');
+  assert.equal((app.match(/setPublication\(serverPublication\(auditRow\)\)/g) || []).length, 2);
+  assert.match(app, /publishState: shownPublishState/, 'the gate reads the effective state');
+  assert.match(app, /publishButtonLabel\(shownPublishState\)/);
+  assert.match(app, /canStartPublish\(shownPublishState\)/);
+  assert.equal(app.includes('not published yet'), false, 'the stale line is gone');
+  assert.equal(app.includes('Currently published scoring'), false, 'and so is the mislabelled live score');
+  assert.match(app, /Published result · frozen/);
+  assert.match(app, /Current audit data/);
+});

@@ -401,9 +401,9 @@ test('the headline says what is there, and never the word critical', () => {
   const cases = [
     [{ percent: null }, /not yet been scored/],
     [{ percent: 96 }, /consistently strong guest experience/],
-    [{ percent: 92, highCount: 1, hasPriorities: true }, /1 high priority issue to address/],
-    [{ percent: 92, highCount: 3, hasPriorities: true }, /3 high priority issues to address/],
-    [{ percent: 80, hasPattern: true, hasPriorities: true }, /recurring pattern across the stay/],
+    [{ percent: 92, highCount: 1, hasPriorities: true }, /one high-priority issue requiring resolution/],
+    [{ percent: 92, highCount: 3, hasPriorities: true }, /three high-priority issues requiring resolution/],
+    [{ percent: 80, hasPattern: true, hasPriorities: true }, /findings recurring across the stay/],
     [{ percent: 60, hasPriorities: true }, /^Mixed overall performance\.$/],
     [{ percent: 30, hasPriorities: true }, /^Overall performance requires attention\.$/],
   ];

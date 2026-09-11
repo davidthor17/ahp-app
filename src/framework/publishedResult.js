@@ -232,11 +232,79 @@ export const INTELLIGENCE_LIMITS = Object.freeze({
   priorities: 5, patterns: 5, strengths: 3, sectionsToWatch: 5,
 });
 
-const SEVERITY_WORD = Object.freeze({ high: 'High', moderate: 'Moderate', low: 'Low' });
-const STATUS_WORD = Object.freeze({ missed: 'Missed', partial: 'Partial' });
 const BAND_WORD = Object.freeze({
   strong: 'Strong', good: 'Good', mixed: 'Mixed', attention: 'Requires attention',
 });
+
+// ── Phase 7.1: client language ──────────────────────────────────────────────
+//
+// A catalogue label names the STANDARD an item was assessed against, not what
+// was found. "No hair, stains, or odors" is what a clean room looks like; set
+// as the title of a missed item it reads as praise. So a label is only ever
+// published quoted, after an outcome that says plainly whether it was met, and
+// never as a sentence of its own. Nothing here claims an observation the audit
+// did not record: "standard not met" is what the status says, and it is all
+// the published data can support.
+
+/** What the status says about the standard, in words a hotel executive reads correctly. */
+const OUTCOME = Object.freeze({ missed: 'Standard not met', partial: 'Standard partly met' });
+
+/**
+ * What each published severity means, as a statement about the shortfall
+ * itself. Deliberately not a claim about consequences for guests or revenue,
+ * which the audit does not measure, and not the word "priority", which the
+ * page already shows beside the title.
+ */
+const SEVERITY_MEANING = Object.freeze({
+  high: 'A serious shortfall against the standard.',
+  moderate: 'A significant shortfall against the standard.',
+  low: 'A minor shortfall against the standard.',
+});
+const SEVERITY_MEANING_EACH = Object.freeze({
+  high: 'Each a serious shortfall against the standard.',
+  moderate: 'Each a significant shortfall against the standard.',
+  low: 'Each a minor shortfall against the standard.',
+});
+
+/** The dimension a cross-area pattern shares, in client words rather than the catalogue's axis name. */
+const DIMENSION_PHRASE = Object.freeze({
+  condition: 'the physical condition of the property',
+  service: 'service delivery',
+  product: 'the product and amenities',
+  experience: 'the overall guest experience',
+});
+
+const NUMBER_WORD = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+/** Small counts in words, larger ones in figures, the way a written report does it. */
+export const numberWord = (n, capital = false) => {
+  const w = Number.isInteger(n) && n >= 0 && n <= 10 ? NUMBER_WORD[n] : String(n);
+  return capital ? w.charAt(0).toUpperCase() + w.slice(1) : w;
+};
+
+/**
+ * A catalogue label as a quoted standard. Some labels carry an em dash, which
+ * the report's copy rules forbid in client-facing text; it becomes a colon,
+ * which keeps the label's own structure ("Website quality: design, content").
+ */
+export const quotedStandard = (label) => {
+  const s = String(label ?? '').trim().replace(/\s*[—–]\s*/g, ': ').replace(/\s*--\s*/g, ': ');
+  return s ? `“${s}”` : null;
+};
+
+/** "A", "A and B", "A, B and C", "A, B, C and two more". */
+const listOf = (items, max = 3) => {
+  if (items.length <= 1) return items.join('');
+  if (items.length <= max) return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+  const rest = items.length - max;
+  return `${items.slice(0, max).join(', ')} and ${numberWord(rest)} more`;
+};
+
+/** A strength's supporting line, varied by position so three strengths never read as one sentence three times. */
+const STRENGTH_REASON = [
+  (n) => `All ${n} standards assessed here were met.`,
+  (n) => `Every assessed standard was met, across ${n} touchpoints.`,
+  (n) => `The standard was met on all ${n} touchpoints assessed.`,
+];
 
 const publicSeverity = (s) => PUBLIC_SEVERITY[s] || 'low';
 
@@ -270,7 +338,10 @@ export function publicBand(percent) {
  * publishing at all: how many priorities the audit produced and whether they
  * connect into a pattern.
  */
-export function publicHeadline({ percent, highCount = 0, hasPattern = false, hasPriorities = false }) {
+export function publicHeadline({
+  percent, highCount = 0, hasPattern = false, hasPriorities = false,
+  standardMet = null, auditType = null,
+}) {
   const band = publicBand(percent);
   if (band === null) return 'This assessment has not yet been scored.';
   // The lowest band reads as a verb rather than an adjective. "Requires
@@ -279,12 +350,21 @@ export function publicHeadline({ percent, highCount = 0, hasPattern = false, has
   const lead = band === 'attention'
     ? 'Overall performance requires attention'
     : `${BAND_WORD[band]} overall performance`;
+  // Phase 7.1. "Good overall performance" beside a status line saying the
+  // standard was not met, with a serious hygiene failure underneath, read as
+  // more positive than the audit was. The band stays what the score says; the
+  // sentence now also says what the status block says, but only where the band
+  // sounds like a pass. "Mixed" and below already carry that on their own. A
+  // Desk Review issues no status, so it is never described against one.
+  const belowStandard = standardMet === false && auditType !== 'desk'
+    && (band === 'strong' || band === 'good');
+  const head = belowStandard ? `${lead} but below the Specula standard` : lead;
   if (highCount > 0) {
-    return `${lead}, with ${highCount} high priority ${highCount === 1 ? 'issue' : 'issues'} to address.`;
+    return `${head}, with ${numberWord(highCount)} high-priority ${highCount === 1 ? 'issue' : 'issues'} requiring resolution.`;
   }
-  if (hasPattern) return `${lead}, with a recurring pattern across the stay.`;
-  if (band === 'strong' && !hasPriorities) return 'A consistently strong guest experience across this stay.';
-  return `${lead}.`;
+  if (hasPattern) return `${head}, with findings recurring across the stay.`;
+  if (band === 'strong' && !hasPriorities && !belowStandard) return 'A consistently strong guest experience across this stay.';
+  return `${head}.`;
 }
 
 const asList = (v) => (Array.isArray(v) ? v : []);
@@ -298,26 +378,33 @@ const asList = (v) => (Array.isArray(v) ? v : []);
  */
 function publicPriority(p, findingById) {
   const severity = publicSeverity(p.severity);
-  const word = SEVERITY_WORD[severity];
   const sectionLabel = asList(p.affectedSections)[0] || asList(p.sectionIds)[0] || 'this audit';
   const count = Number.isFinite(p.findingCount) ? p.findingCount : asList(p.findingIds).length;
-  const finding = findingById.get(asList(p.findingIds)[0]) || null;
+  const findings = asList(p.findingIds).map((id) => findingById.get(id)).filter(Boolean);
+  const finding = findings[0] || null;
 
+  // Phase 7.1. The title says WHAT needs attention and whether the standard
+  // was met; the reason says WHERE and HOW SERIOUS. Neither repeats the other,
+  // and neither repeats the severity word the page prints beside the title.
   let title;
   let reason;
   if (count > 1) {
-    title = `${word} priority: ${count} items in ${sectionLabel}`;
-    reason = `${count} items in ${sectionLabel} were not fully met. Ranked ${severity} priority.`;
+    title = `${numberWord(count, true)} standards not fully met in ${sectionLabel}`;
+    // A grouped priority names what was actually missed. "4 items in
+    // Reception" told a reader nothing they could act on.
+    const named = findings.map((f) => quotedStandard(f.label)).filter(Boolean);
+    reason = named.length
+      ? `${listOf(named)}. ${SEVERITY_MEANING_EACH[severity]}`
+      : `${sectionLabel}. ${SEVERITY_MEANING_EACH[severity]}`;
   } else if (finding && finding.label) {
-    title = `${word} priority: ${finding.label}`;
-    const status = STATUS_WORD[finding.status] || finding.status || 'not fully met';
-    reason = `Recorded in ${sectionLabel} as ${status}. Ranked ${severity} priority.`;
+    title = `${OUTCOME[finding.status] || 'Standard not met'}: ${quotedStandard(finding.label)}`;
+    reason = `${sectionLabel}. ${SEVERITY_MEANING[severity]}`;
   } else {
     // The finding behind this priority is not in the findings array. The
     // priority is still real, so it is published without the detail rather than
     // dropped or filled in with a guess.
-    title = `${word} priority in ${sectionLabel}`;
-    reason = `Recorded in ${sectionLabel}. Ranked ${severity} priority.`;
+    title = `A standard was not fully met in ${sectionLabel}`;
+    reason = `${sectionLabel}. ${SEVERITY_MEANING[severity]}`;
   }
 
   return {
@@ -332,6 +419,24 @@ function publicPriority(p, findingById) {
 }
 
 /**
+ * The cross-area pattern, restated with the areas named and the shared
+ * dimension in client words. Null for any other pattern, or when the dimension
+ * is one this file has no words for, so the upstream sentence is kept rather
+ * than replaced with a guess.
+ */
+function crossAreaExplanation(p) {
+  if (p.type !== 'cross_section_dimension') return null;
+  const phrase = DIMENSION_PHRASE[p.dimension];
+  if (!phrase) return null;
+  const labels = asList(p.sectionIds)
+    .slice()
+    .sort((a, b) => (SECTION_POSITION.get(a) ?? 999) - (SECTION_POSITION.get(b) ?? 999))
+    .map((id) => SECTION_LABEL.get(id) || id);
+  if (labels.length < 2) return null;
+  return `Findings about ${phrase} were recorded in ${listOf(labels, labels.length)}.`;
+}
+
+/**
  * Build the curated intelligence block, or null when there is nothing to build
  * it from.
  *
@@ -342,7 +447,10 @@ function publicPriority(p, findingById) {
  *   the headline and the figure the page prints cannot disagree
  */
 export function buildPublishedIntelligence(input = {}) {
-  const { intelligence = null, executiveReport = null, score = null } = input;
+  const {
+    intelligence = null, executiveReport = null, score = null,
+    standardMet = null, auditType = null,
+  } = input;
   if (!intelligence || !executiveReport) return null;
 
   const findingById = new Map(asList(intelligence.findings).map((f) => [f.itemId, f]));
@@ -357,17 +465,25 @@ export function buildPublishedIntelligence(input = {}) {
       type: PUBLIC_PATTERN_TYPE[p.type] || 'recurring',
       severity: publicSeverity(p.severity),
       // Already written for a reader who will never open a checklist, and
-      // built from counts and section labels rather than from any note.
-      explanation: p.explanation,
+      // built from counts and section labels rather than from any note. The
+      // one exception is the cross-area pattern, whose upstream sentence names
+      // the catalogue's internal axis ("Condition-related findings") and
+      // counts the areas without naming them.
+      explanation: crossAreaExplanation(p) || p.explanation,
       sectionIds: [...asList(p.sectionIds)],
     }));
 
+  // Phase 7.1. Titled by the section itself, with the supporting line varied
+  // by position. Three "Consistently strong performance in X" sentences in a
+  // row read as a template, which is exactly what they were.
   const strengths = asList(executiveReport.strengths)
     .slice(0, INTELLIGENCE_LIMITS.strengths)
-    .map((s) => ({
+    .map((s, i) => ({
       sectionId: s.sectionId,
-      title: s.title,
-      reason: s.reason,
+      title: SECTION_LABEL.get(s.sectionId) || s.title,
+      reason: Number.isFinite(s.assessedCount) && s.assessedCount > 0
+        ? STRENGTH_REASON[i % STRENGTH_REASON.length](s.assessedCount)
+        : s.reason,
       assessedCount: s.assessedCount,
     }));
 
@@ -418,6 +534,7 @@ export function buildPublishedIntelligence(input = {}) {
   return {
     headline: publicHeadline({
       percent, highCount, hasPattern: patterns.length > 0, hasPriorities: priorities.length > 0,
+      standardMet, auditType,
     }),
     summary,
     keyMetrics,
@@ -463,7 +580,7 @@ export function buildPublishedResult(input = {}) {
     note: trimOrNull(f.note),
   }));
   const standardMet = meetsStandard(auditType, score.percent, failures.length);
-  const published = buildPublishedIntelligence({ intelligence, executiveReport, score });
+  const published = buildPublishedIntelligence({ intelligence, executiveReport, score, standardMet, auditType });
 
   return {
     formatVersion: PUBLISHED_RESULT_VERSION,

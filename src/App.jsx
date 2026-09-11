@@ -59,6 +59,7 @@ import {
 } from "./framework/auditCompletion.js";
 import {
   PUBLISH_STATE, PUBLISH_TIMEOUT_MS, publishBlockers, canPublish,
+  serverPublication, effectivePublishState, scoreDisplay,
   blockerMessage, canStartPublish, afterPublish, publishFailureMessage,
   publishButtonLabel,
 } from "./framework/publishSafety.js";
@@ -300,6 +301,10 @@ export default function AHPAudit() {
   const [summaryDraft, setSummaryDraft]   = useState('');
   const [auditTier, setAuditTier]         = useState('full'); // desk | spot | full
   const [publishState, setPublishState]   = useState(PUBLISH_STATE.IDLE);
+  // Phase 7.1. What the server records about this audit's publication, read
+  // with the row. publishState above is only this session's memory of an
+  // attempt and resets on reload; this does not.
+  const [publication, setPublication]     = useState(null);
   // Phase 6.7. Fetched fresh each time the preview opens, rather than
   // inferred from publishState: an auditor can open the preview for an
   // audit that was published in an earlier session, where publishState is
@@ -516,7 +521,7 @@ export default function AHPAudit() {
     try {
       const { data: auditRow, error: aErr } = await supabase
         .from('audits')
-        .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at')
+        .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at, status, published_result')
         .eq('id', row.id).maybeSingle();
       if (aErr) throw aErr;
 
@@ -555,6 +560,10 @@ export default function AHPAudit() {
         auditTierRef.current = auditRow.tier;
         setAuditTier(auditRow.tier);
       }
+      // A different audit is being taken up. Whatever the last one's publish
+      // attempt left behind says nothing about this one; the row does.
+      setPublishState(PUBLISH_STATE.IDLE);
+      setPublication(serverPublication(auditRow));
       setReviewAuditId(null);
       setReviewMeta(null);
       setActiveShiftId(sys.shifts[0].id);
@@ -656,6 +665,11 @@ export default function AHPAudit() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session === undefined]);
 
+  // A publication belongs to one audit. Starting or opening another clears it
+  // until that audit's own row says otherwise, so a published audit's state
+  // can never carry over onto a new draft.
+  useEffect(() => { setPublication(null); }, [ids.auditId]);
+
   // once signed in, if there's an auditId already known, pull the latest remote copy
   // (covers: same auditor picks this up on a second device)
   useEffect(() => {
@@ -675,7 +689,7 @@ export default function AHPAudit() {
         // transport failure.
         const { data: auditRow, error: aErr } = await supabase
           .from('audits')
-          .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at')
+          .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at, status, published_result')
           .eq('id', ids.auditId).maybeSingle();
         if (aErr) throw aErr;
 
@@ -716,6 +730,10 @@ export default function AHPAudit() {
           auditTierRef.current = auditRow.tier;
           setAuditTier(auditRow.tier);
         }
+        // Phase 7.1. Reloading an audit that was already published left this
+        // session believing it was a draft and offered PUBLISH again. The row
+        // is the record, so the screen follows it.
+        setPublication(serverPublication(auditRow));
         // An audit that is not in the database is not synced, whatever else
         // succeeded. Saying otherwise would tell an auditor their work is
         // stored when there is nothing on the other end to store it in.
@@ -1344,7 +1362,7 @@ export default function AHPAudit() {
       setSyncState('synced');
       // serverConfirmed is what lets the UI say "published" honestly. Nothing
       // downstream may claim it without this.
-      return { ok: true, serverConfirmed: true };
+      return { ok: true, serverConfirmed: true, payload };
     } catch (e) {
       setSyncState('error');
       // A timeout is its own outcome, not a generic error: nothing was
@@ -1593,10 +1611,14 @@ export default function AHPAudit() {
 
   // The publish gate, derived from what is actually true. Never a boolean
   // nobody can read: a list, so the screen can say which reason applies.
+  // What the screen shows: PUBLISHED whenever the row says so, whatever this
+  // session remembers. The gate reads it too, so an already-published audit is
+  // never offered a publish action in the first place.
+  const shownPublishState = effectivePublishState(publishState, publication);
   const publishGate = publishBlockers({
     hasSession: !!session, readOnly, hasAudit: !!ids.auditId,
     pendingWrites, blockedWrites, unsavedPhotos: outstandingPhotoCount,
-    needsLegacyAck, legacyAck, publishState,
+    needsLegacyAck, legacyAck, publishState: shownPublishState,
   });
   const publishAllowed = publishGate.length === 0;
 
@@ -2627,6 +2649,9 @@ export default function AHPAudit() {
             <div style={{ fontSize: '12px', color: C.muted, marginTop: '5px' }}>
               {prop.category} · {auditTier === 'desk' ? 'Desk Review' : auditTier === 'spot' ? 'Spot Audit' : 'Full Audit'}
               {ids.auditRef ? ` · ${ids.auditRef}` : ''}
+              {shownPublishState === PUBLISH_STATE.PUBLISHED && (
+                <span data-published-badge style={{ marginLeft: '8px', padding: '2px 7px', borderRadius: '4px', border: `1px solid ${C.goldBorder || C.border}`, color: C.gold, fontSize: '10px', fontWeight: '700', letterSpacing: '0.08em' }}>PUBLISHED</span>
+              )}
             </div>
           </div>
 
@@ -2725,22 +2750,69 @@ export default function AHPAudit() {
             <span>›</span>
           </button>
 
-          {/* Legacy scoring. Still the number that publishAudit() writes and the
-              published report renders, so it stays visible and is labelled. */}
-          {scorePct !== null && (
-            <div style={{ marginBottom: '22px' }}>
-              <span style={lbl}>Currently published scoring</span>
-              <div style={{ padding: '14px 16px', borderRadius: '10px', background: willPass ? 'rgba(77,200,122,0.1)' : C.surface2, border: `1px solid ${willPass ? 'rgba(77,200,122,0.35)' : C.border}` }}>
-                <div style={{ fontSize: '13px', fontWeight: '700', color: willPass ? '#4DC87A' : C.dim }}>
-                  {auditTier === 'desk' ? `${scorePct}% — no seal (Desk Review)` : willPass ? `${scorePct}% — meets the standard` : `${scorePct}% — below ${PASS_THRESHOLD}% threshold`}
+          {/* The public score. Before publication it is what the report will
+              show; after it, two different figures exist and must never be
+              confused: the frozen one on the public report, and whatever the
+              audit's grades add up to now, which moves the moment an item is
+              changed after publishing. Phase 7.0 found the second labelled as
+              "currently published" while the report still showed the first. */}
+          {(() => {
+            const sd = scoreDisplay({ publication, livePercent: scorePct });
+            if (sd.mode === 'published') {
+              const on = publication.publishedAt
+                ? new Date(publication.publishedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+                : null;
+              return (
+                <div style={{ marginBottom: '22px' }} data-score-mode="published">
+                  <span style={lbl}>Published result · frozen</span>
+                  <div style={{ padding: '14px 16px', borderRadius: '10px', background: C.goldBg || C.surface2, border: `1px solid ${C.goldBorder || C.border}` }}>
+                    {sd.legacy ? (
+                      <>
+                        <div style={{ fontSize: '13px', fontWeight: '700', color: C.gold }}>Published before reports were frozen</div>
+                        <div style={{ fontSize: '11px', color: C.muted, marginTop: '8px', lineHeight: '1.5' }}>
+                          This is a legacy report. Its public page is still calculated from this audit's item grades, so changes made here can alter what the public sees.
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div style={{ fontSize: '13px', fontWeight: '700', color: C.gold }} data-frozen-percent={sd.frozenPercent}>{sd.frozenPercent}% on the public report</div>
+                        <div style={{ fontSize: '11px', color: C.muted, marginTop: '8px', lineHeight: '1.5' }}>
+                          Published{on ? ` on ${on}` : ''}. This figure and the rest of the public report are frozen and cannot change.
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  {sd.livePercent !== null && (
+                    <div style={{ marginTop: '8px', padding: '10px 14px', borderRadius: '10px', background: C.surface2, border: `1px solid ${C.border}` }}>
+                      <div style={{ fontSize: '12px', fontWeight: '600', color: C.dim }} data-live-percent={sd.livePercent}>
+                        Current audit data: {sd.livePercent}%{sd.diverged ? ', which differs from the published figure' : ''}
+                      </div>
+                      <div style={{ fontSize: '11px', color: C.muted, marginTop: '4px', lineHeight: '1.5' }}>
+                        {sd.legacy
+                          ? 'Calculated from the audit as it stands now. This legacy report reflects it.'
+                          : 'Calculated from the audit as it stands now. It is not published and does not change the public report.'}
+                      </div>
+                    </div>
+                  )}
                 </div>
-                {failures.length > 0 && auditTier !== 'desk' && <div style={{ fontSize: '12px', color: C.warn, marginTop: '4px' }}>{failures.length} critical failure{failures.length > 1 ? 's' : ''} also blocks the seal, regardless of score.</div>}
-                <div style={{ fontSize: '11px', color: C.muted, marginTop: '8px', lineHeight: '1.5' }}>
-                  This is the figure the public report still uses. The framework result above is not published yet.
+              );
+            }
+            if (scorePct === null) return null;
+            return (
+              <div style={{ marginBottom: '22px' }} data-score-mode="unpublished">
+                <span style={lbl}>Public score on publication</span>
+                <div style={{ padding: '14px 16px', borderRadius: '10px', background: willPass ? 'rgba(77,200,122,0.1)' : C.surface2, border: `1px solid ${willPass ? 'rgba(77,200,122,0.35)' : C.border}` }}>
+                  <div style={{ fontSize: '13px', fontWeight: '700', color: willPass ? '#4DC87A' : C.dim }}>
+                    {auditTier === 'desk' ? `${scorePct}% — no seal (Desk Review)` : willPass ? `${scorePct}% — meets the standard` : `${scorePct}% — below ${PASS_THRESHOLD}% threshold`}
+                  </div>
+                  {failures.length > 0 && auditTier !== 'desk' && <div style={{ fontSize: '12px', color: C.warn, marginTop: '4px' }}>{failures.length} critical failure{failures.length > 1 ? 's' : ''} also blocks the seal, regardless of score.</div>}
+                  <div style={{ fontSize: '11px', color: C.muted, marginTop: '8px', lineHeight: '1.5' }}>
+                    This is the figure the public report will show once this audit is published, and it is frozen from then on. The framework result above shapes the published priorities, patterns and strengths, but its own percentage is never published.
+                  </div>
                 </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           <div style={{ marginBottom: '20px' }}>
             <span style={lbl}>Critical Failures ({failures.length})</span>
@@ -2821,7 +2893,7 @@ export default function AHPAudit() {
             disabled={!publishAllowed}
             onClick={async () => {
               // The ref, not the state, is what makes this single flight.
-              if (publishingRef.current || !canStartPublish(publishState)) return;
+              if (publishingRef.current || !canStartPublish(shownPublishState)) return;
               publishingRef.current = true;
               setPublishState(PUBLISH_STATE.PUBLISHING);
               try {
@@ -2830,6 +2902,17 @@ export default function AHPAudit() {
                 setPublishReason(next.reason);
                 // PUBLISHED is set only from a result the server confirmed.
                 setPublishState(next.state);
+                // The publication on record follows. A confirmed publish knows
+                // exactly what it froze; a refusal means one already exists,
+                // so the row is read rather than the payload that was refused.
+                if (res && res.ok && res.payload) {
+                  setPublication(serverPublication({ status: 'published', published_result: res.payload }));
+                } else if (res && res.reason === 'already-published') {
+                  try {
+                    const { data } = await supabase.from('audits').select('status, published_result').eq('id', ids.auditId).maybeSingle();
+                    setPublication(serverPublication(data));
+                  } catch (e) { /* the refusal message already says what happened */ }
+                }
               } finally {
                 // Always released, including on a timeout. The lock outliving
                 // the attempt is what trapped the auditor in PUBLISHING.
@@ -2843,17 +2926,21 @@ export default function AHPAudit() {
               fontSize: '14px', fontWeight: '700', letterSpacing: '0.06em',
               cursor: publishAllowed ? 'pointer' : 'default',
             }}>
-            {publishButtonLabel(publishState)}
+            {publishButtonLabel(shownPublishState)}
           </button>
 
-          {publishState === PUBLISH_STATE.FAILED && (
+          {shownPublishState === PUBLISH_STATE.FAILED && (
             <div style={{ marginTop: '10px', fontSize: '12px', color: '#E05555', lineHeight: '1.5' }}>
               {publishFailureMessage(publishReason)}
             </div>
           )}
-          {publishState === PUBLISH_STATE.PUBLISHED && (
+          {shownPublishState === PUBLISH_STATE.PUBLISHED && (
             <div style={{ marginTop: '14px' }}>
-              <div style={{ fontSize: '12px', color: '#4DC87A', marginBottom: '8px' }}>This audit is now live for {prop.name}.</div>
+              <div style={{ fontSize: '12px', color: '#4DC87A', marginBottom: '8px' }}>
+                {publishState === PUBLISH_STATE.PUBLISHED
+                  ? `This audit is now live for ${prop.name}.`
+                  : 'Published and live. The public report is frozen and will not change.'}
+              </div>
               {ids.auditRef && (
                 <div style={{ padding: '12px 14px', borderRadius: '8px', background: C.surface2, border: `1px solid ${C.border}`, fontFamily: "'IBM Plex Mono', monospace", fontSize: '12px', color: C.dim, wordBreak: 'break-all' }}>
                   speculaone.com/report.html?ref={ids.auditRef}
