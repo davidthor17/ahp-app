@@ -872,6 +872,23 @@ export default function AHPAudit() {
     });
     if (blockers.length > 0) { setStartError(startAuditMessage(blockers[0])); return; }
     setStartError(null);
+    // Phase 7.3A. The basis refs belong to the audit being left behind, not to
+    // the tab.
+    //
+    // writeSettledRef latches whenever a lock write matches no row: another
+    // session locked it first, or — as happened in production on 2026-09-12 —
+    // the audit had been deleted while this device still held its id. Until it
+    // is cleared, persistSnapshot returns early for every audit opened
+    // afterwards, so the next audit freezes a perfectly good basis locally and
+    // never records it. It then resumes as legacy, and publishes carrying a
+    // permanent "the basis was never recorded" line.
+    //
+    // resumeAudit has always reset both of these; this path did not, which is
+    // what left AHP-2026-168C4CA8 legacy. They are deliberately not in
+    // resetAuditScopedState: resumeAudit calls that after reading the row's
+    // basis into rowSnapshotRef, so clearing them there would discard it.
+    rowSnapshotRef.current = null;
+    writeSettledRef.current = false;
     setReviewAuditId(null);
     setReviewMeta(null);
     const fresh = blankProperty();
