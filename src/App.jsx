@@ -896,6 +896,25 @@ export default function AHPAudit() {
   }, []);
 
   /**
+   * The auditor chooses a tier.
+   *
+   * Phase 7.3C, second attempt. The first version wrote the map from an effect
+   * watching auditTier, and that effect cannot tell "the auditor chose Spot"
+   * from "an audit was just opened and reset to Full". It also reads the audit
+   * id out of whichever render it closed over. In production that filed the
+   * newly opened audit's default Full under the previous audit's id: C's Spot
+   * became Full and D got no entry at all.
+   *
+   * A click has none of that ambiguity. The button is on the finish screen of
+   * one audit, ids is that audit, and the only writes to the map are choices an
+   * auditor actually made. Adoption now only ever reads it.
+   */
+  const chooseTier = useCallback((tier) => {
+    setAuditTier(tier);
+    persistTier(ids.auditId, tier);
+  }, [ids.auditId, persistTier]);
+
+  /**
    * Start the next hotel's audit.
    *
    * Phase 7.3. There was no way to do this at all. ensureRemoteAudit reuses
@@ -957,10 +976,11 @@ export default function AHPAudit() {
   // Changing the tier is a change to the audit, and it is usually the last
   // thing done before publishing. Nothing else calls persist() at that point,
   // so without this the choice would live only in memory.
+  // The durable per-audit record is written by chooseTier, at the click. This
+  // effect deliberately does not touch it: it also fires when opening an audit
+  // resets the tier, and it cannot tell that apart from a choice.
   useEffect(() => {
     if (readOnly || !prop.name) return;
-    // Against this audit's id, so opening another one cannot overwrite it.
-    persistTier(ids.auditId, auditTier);
     persist(prop, audit, ids);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auditTier]);
@@ -2912,7 +2932,7 @@ export default function AHPAudit() {
             <div style={{ display: 'flex', gap: '8px' }}>
               {[{ id: 'desk', label: 'Desk Review' }, { id: 'spot', label: 'Spot Audit' }, { id: 'full', label: 'Full Audit' }].map(t => {
                 const active = auditTier === t.id;
-                return <button key={t.id} onClick={() => setAuditTier(t.id)} style={{ flex: 1, padding: '10px 6px', borderRadius: '8px', cursor: 'pointer', border: `1px solid ${active ? C.gold : C.border}`, background: active ? C.goldBg : 'transparent', color: active ? C.gold : C.dim, fontSize: '12px', fontWeight: '600' }}>{t.label}</button>;
+                return <button key={t.id} onClick={() => chooseTier(t.id)} style={{ flex: 1, padding: '10px 6px', borderRadius: '8px', cursor: 'pointer', border: `1px solid ${active ? C.gold : C.border}`, background: active ? C.goldBg : 'transparent', color: active ? C.gold : C.dim, fontSize: '12px', fontWeight: '600' }}>{t.label}</button>;
               })}
             </div>
             {auditTier === 'desk' && <div style={{ fontSize: '11px', color: C.muted, marginTop: '8px' }}>Desk reviews are internal only — no public seal is issued, regardless of score.</div>}

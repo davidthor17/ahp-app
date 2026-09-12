@@ -137,7 +137,10 @@ test('the tier is written read-modify-write, against the audit id', () => {
   assert.match(fn, /const raw = localStorage\.getItem\(STORAGE_KEY\);/, 'read');
   assert.match(fn, /data\.tiersByAudit = rememberTier\(data\.tiersByAudit, auditId, tier\);/, 'modify');
   assert.match(fn, /localStorage\.setItem\(STORAGE_KEY, JSON\.stringify\(data\)\);/, 'write');
-  assert.match(APP, /persistTier\(ids\.auditId, auditTier\);/, 'called when the tier changes');
+  // Written at the click, not from an effect watching auditTier: an effect
+  // cannot tell a choice from an audit being opened and reset, which is how
+  // the first attempt filed one audit's default under another's id.
+  assert.match(APP, /persistTier\(ids\.auditId, tier\);/, 'called when the auditor chooses a tier');
 });
 
 test('resume and reload both consult the map', () => {
