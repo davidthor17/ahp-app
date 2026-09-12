@@ -40,6 +40,72 @@ export function tierForAudit(rowTier, fallback = DEFAULT_TIER) {
   return AUDIT_TIERS.includes(fallback) ? fallback : DEFAULT_TIER;
 }
 
+// ── where an unpublished audit's tier lives ─────────────────────────────────
+//
+// Phase 7.3C. The tier had no audit-scoped durable home at all. It lived in
+// React state and in one `auditTier` slot in the device cache, and that slot
+// belongs to whichever audit is open: starting or resuming another audit
+// overwrites it. The row cannot help either, because audits.tier is written
+// only at publish, so a draft's row says nothing. The result was that an
+// auditor who chose Spot, opened another audit and came back found Full, and
+// would have published a Spot Audit as a Full one.
+//
+// Phase 7.3 had stopped the tier bleeding from one audit into the next, which
+// was the right half of the problem. This is the other half: somewhere for it
+// to live. A map keyed by audit id, in the same cache, written the same
+// read-modify-write way pendingQueue and pendingCaptions already are, so one
+// audit's choice can never be another's and nothing overwrites it wholesale.
+//
+// Deliberately not a row write. audits.tier at publish time is the product
+// rule, and a draft that has not been published has not chosen anything the
+// database needs to know about yet.
+
+/** Every remembered tier, cleaned of anything this console would not accept. */
+export function readTierMap(stored) {
+  const out = {};
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return out;
+  for (const [auditId, tier] of Object.entries(stored)) {
+    if (typeof auditId === 'string' && auditId && typeof tier === 'string' && AUDIT_TIERS.includes(tier)) {
+      out[auditId] = tier;
+    }
+  }
+  return out;
+}
+
+/**
+ * Record one audit's tier, returning a new map.
+ *
+ * An audit with no id yet (offline, before BEGIN AUDIT) records nothing: there
+ * is no key to file it under, and the single-slot cache still carries it for
+ * the session, which is all it could ever have had.
+ */
+export function rememberTier(stored, auditId, tier) {
+  const map = readTierMap(stored);
+  if (!auditId || typeof auditId !== 'string') return map;
+  if (!AUDIT_TIERS.includes(tier)) return map;
+  return { ...map, [auditId]: tier };
+}
+
+/** What was remembered for this audit, or null. */
+export function rememberedTier(stored, auditId) {
+  if (!auditId) return null;
+  return readTierMap(stored)[auditId] || null;
+}
+
+/**
+ * The tier to open an audit with.
+ *
+ * The row first, because a published audit's tier is a fact about what was
+ * issued and outranks anything this device remembers. Then what this device
+ * remembers for that audit, which is the only record a draft has. Then Full,
+ * which is what an audit with no recorded tier has always been scored as.
+ */
+export function tierForOpenAudit({ rowTier = null, remembered = null } = {}) {
+  if (typeof rowTier === 'string' && AUDIT_TIERS.includes(rowTier)) return rowTier;
+  if (typeof remembered === 'string' && AUDIT_TIERS.includes(remembered)) return remembered;
+  return DEFAULT_TIER;
+}
+
 /**
  * Every piece of state that belongs to one audit, at its empty value.
  *

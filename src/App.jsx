@@ -33,7 +33,7 @@ import {
 } from "./framework/syncQueue.js";
 import {
   auditScopedReset, startAuditBlockers, startAuditMessage, newAuditIds,
-  mergeDeviceState, tierForAudit,
+  mergeDeviceState, tierForAudit, rememberTier, rememberedTier, tierForOpenAudit,
 } from "./framework/auditSession.js";
 import {
   UPDATE_STATE, updateBannerState, updateBannerText, buildAgeDays,
@@ -621,7 +621,18 @@ export default function AHPAudit() {
       // A different audit is being taken up. Everything the last one left
       // behind goes with it, including the tier: a draft row carries none, and
       // keeping the previous audit's is how a Spot Audit became a Full one.
-      resetAuditScopedState({ tier: auditRow && auditRow.tier });
+      // Phase 7.3C. The row first, then what this device remembers for this
+      // audit. A draft's row carries no tier at all, and the single cache slot
+      // was overwritten the moment another audit was opened, so without the
+      // map a Spot Audit resumed as a Full one.
+      let rememberedForThisAudit = null;
+      try {
+        const cached = localStorage.getItem(STORAGE_KEY);
+        rememberedForThisAudit = rememberedTier(cached ? JSON.parse(cached).tiersByAudit : null, row.id);
+      } catch (e) { /* nothing remembered reads the same as nothing recorded */ }
+      resetAuditScopedState({
+        tier: tierForOpenAudit({ rowTier: auditRow && auditRow.tier, remembered: rememberedForThisAudit }),
+      });
       // Whatever this session remembers about publishing says nothing about
       // this audit; the row does.
       setPublication(serverPublication(auditRow));
@@ -712,10 +723,14 @@ export default function AHPAudit() {
           if (data.trailQueue) setTrailQueue(data.trailQueue);
           // Only a tier this app recognises. A missing one means the audit
           // predates tier persistence, and Full is what it was scored as.
-          if (data.auditTier && ['desk', 'spot', 'full'].includes(data.auditTier)) {
-            auditTierRef.current = data.auditTier;
-            setAuditTier(data.auditTier);
-          }
+          //
+          // Phase 7.3C: the per-audit map is consulted first, because the
+          // single slot beside it belongs to whichever audit was last open.
+          const restoredTier = tierForOpenAudit({
+            remembered: rememberedTier(data.tiersByAudit, data.ids && data.ids.auditId) || data.auditTier,
+          });
+          auditTierRef.current = restoredTier;
+          setAuditTier(restoredTier);
           const sys = SHIFT_SYSTEMS[data.prop && data.prop.shiftCount] || SHIFT_SYSTEMS['3'];
           setActiveShiftId(sys.shifts[0].id);
           setScreen(data.prop && data.prop.name ? 'home' : 'setup');
@@ -857,6 +872,30 @@ export default function AHPAudit() {
   }, []);
 
   /**
+   * Remember one audit's tier, against that audit's id.
+   *
+   * Phase 7.3C. Read-modify-write, exactly as persistQueue is, and for the same
+   * reason: this map outlives the audit that happens to be open, so it must
+   * never be written as part of a whole-blob replace. The single `auditTier`
+   * slot in the cache stays where it is and still carries the open audit, but
+   * it is no longer the only record: that slot belongs to whichever audit was
+   * last open, which is why a Spot Audit came back as Full after opening
+   * another audit and returning.
+   *
+   * Nothing is written to the row. audits.tier is set at publish, which is the
+   * product rule, and a draft has not chosen anything the database needs yet.
+   */
+  const persistTier = useCallback((auditId, tier) => {
+    if (!auditId) return;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const data = raw ? JSON.parse(raw) : {};
+      data.tiersByAudit = rememberTier(data.tiersByAudit, auditId, tier);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {}
+  }, []);
+
+  /**
    * Start the next hotel's audit.
    *
    * Phase 7.3. There was no way to do this at all. ensureRemoteAudit reuses
@@ -920,6 +959,8 @@ export default function AHPAudit() {
   // so without this the choice would live only in memory.
   useEffect(() => {
     if (readOnly || !prop.name) return;
+    // Against this audit's id, so opening another one cannot overwrite it.
+    persistTier(ids.auditId, auditTier);
     persist(prop, audit, ids);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auditTier]);
