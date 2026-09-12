@@ -631,7 +631,14 @@ export default function AHPAudit() {
         rememberedForThisAudit = rememberedTier(cached ? JSON.parse(cached).tiersByAudit : null, row.id);
       } catch (e) { /* nothing remembered reads the same as nothing recorded */ }
       resetAuditScopedState({
-        tier: tierForOpenAudit({ rowTier: auditRow && auditRow.tier, remembered: rememberedForThisAudit }),
+        tier: tierForOpenAudit({
+          rowTier: auditRow && auditRow.tier,
+          remembered: rememberedForThisAudit,
+          // The row decides only once it has been published. On a draft,
+          // audits.tier is the column default and outranking the auditor's
+          // recorded choice with it is what made the map unreachable.
+          published: Boolean(auditRow && auditRow.status === 'published'),
+        }),
       });
       // Whatever this session remembers about publishing says nothing about
       // this audit; the row does.
@@ -803,15 +810,25 @@ export default function AHPAudit() {
           // a second session cannot start a fresh one alongside it.
           adoptAudit(audit, picked.snapshot);
         }
-        // The tier the row already carries outranks whatever this session
-        // started with. It is written at publish, so before then it is null and
-        // this leaves the local choice alone. What counts as a tier is decided
-        // in one place, framework/auditSession.js, rather than by an inline
-        // list here and another one there.
-        if (auditRow && auditRow.tier) {
-          const rowTier = tierForAudit(auditRow.tier, auditTierRef.current);
-          auditTierRef.current = rowTier;
-          setAuditTier(rowTier);
+        // Phase 7.3C. The same precedence the resume path uses, because this
+        // effect runs straight after it and would otherwise undo it: a
+        // published row's tier is what was issued and wins, a draft row's is
+        // the column default and must not override what this device remembers
+        // for this audit. What counts as a tier is decided in one place,
+        // framework/auditSession.js.
+        if (auditRow) {
+          let rememberedHere = null;
+          try {
+            const cached = localStorage.getItem(STORAGE_KEY);
+            rememberedHere = rememberedTier(cached ? JSON.parse(cached).tiersByAudit : null, ids.auditId);
+          } catch (e) { /* nothing remembered reads the same as nothing recorded */ }
+          const nextTier = tierForOpenAudit({
+            rowTier: auditRow.tier,
+            remembered: rememberedHere,
+            published: auditRow.status === 'published',
+          });
+          auditTierRef.current = nextTier;
+          setAuditTier(nextTier);
         }
         // Phase 7.1. Reloading an audit that was already published left this
         // session believing it was a draft and offered PUBLISH again. The row

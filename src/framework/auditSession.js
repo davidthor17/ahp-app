@@ -95,14 +95,26 @@ export function rememberedTier(stored, auditId) {
 /**
  * The tier to open an audit with.
  *
- * The row first, because a published audit's tier is a fact about what was
- * issued and outranks anything this device remembers. Then what this device
- * remembers for that audit, which is the only record a draft has. Then Full,
- * which is what an audit with no recorded tier has always been scored as.
+ * Phase 7.3C. The first version read the row first, unconditionally, and that
+ * made the whole per-audit map unreachable: audits.tier defaults to 'full', so
+ * every draft row carries 'full' whether or not anybody chose it. C was set to
+ * Spot, the map recorded it correctly, and resuming C still resolved Full
+ * because the row's default outranked the only record of the auditor's choice.
+ *
+ * The row's tier is a decision only once the audit is published, which is when
+ * publishAudit actually writes the chosen tier to it. Before that it is a
+ * column default and says nothing:
+ *
+ *   published row tier    what was issued, and nothing may override it
+ *   remembered tier       the only record a draft's choice has
+ *   draft row tier        a default, used when nothing was remembered
+ *   Full                  what an audit with no recorded tier always was
  */
-export function tierForOpenAudit({ rowTier = null, remembered = null } = {}) {
-  if (typeof rowTier === 'string' && AUDIT_TIERS.includes(rowTier)) return rowTier;
-  if (typeof remembered === 'string' && AUDIT_TIERS.includes(remembered)) return remembered;
+export function tierForOpenAudit({ rowTier = null, remembered = null, published = false } = {}) {
+  const valid = (t) => typeof t === 'string' && AUDIT_TIERS.includes(t);
+  if (published && valid(rowTier)) return rowTier;
+  if (valid(remembered)) return remembered;
+  if (valid(rowTier)) return rowTier;
   return DEFAULT_TIER;
 }
 

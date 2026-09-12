@@ -95,10 +95,14 @@ test('two audits keep their own tiers at the same time', () => {
 // ── precedence ──────────────────────────────────────────────────────────────
 
 test('a published row\'s tier outranks anything this device remembers', () => {
+  // published: true is the whole point. Without it these are draft rows, whose
+  // tier is the column default and must not beat the auditor's recorded choice.
   const map = rememberTier(undefined, C, 'spot');
-  assert.equal(tierForOpenAudit({ rowTier: 'full', remembered: rememberedTier(map, C) }), 'full',
+  assert.equal(tierForOpenAudit({ rowTier: 'full', remembered: rememberedTier(map, C), published: true }), 'full',
     'what was issued is a fact; the device does not get to argue with it');
-  assert.equal(tierForOpenAudit({ rowTier: 'desk', remembered: 'spot' }), 'desk');
+  assert.equal(tierForOpenAudit({ rowTier: 'desk', remembered: 'spot', published: true }), 'desk');
+  assert.equal(tierForOpenAudit({ rowTier: 'full', remembered: 'spot' }), 'spot',
+    'but a draft row default never wins');
 });
 
 test('nothing recorded anywhere is Full, and rubbish is never trusted', () => {
@@ -145,7 +149,9 @@ test('the tier is written read-modify-write, against the audit id', () => {
 
 test('resume and reload both consult the map', () => {
   assert.match(APP, /rememberedTier\(cached \? JSON\.parse\(cached\)\.tiersByAudit : null, row\.id\)/, 'resume');
-  assert.match(APP, /tierForOpenAudit\(\{ rowTier: auditRow && auditRow\.tier, remembered: rememberedForThisAudit \}\)/, 'resume precedence');
+  // Multi-line since Phase 7.3C added the published flag; the flag itself is
+  // pinned in tier-precedence.test.js.
+  assert.match(APP, /tierForOpenAudit\(\{[\s\S]{0,400}rowTier: auditRow && auditRow\.tier,[\s\S]{0,400}remembered: rememberedForThisAudit,/, 'resume precedence');
   assert.match(APP, /rememberedTier\(data\.tiersByAudit, data\.ids && data\.ids\.auditId\) \|\| data\.auditTier/, 'reload prefers the map over the slot');
   assert.equal(/\['desk', 'spot', 'full'\]\.includes\(data\.auditTier\)/.test(APP), false,
     'the inline tier list that only knew about the single slot is gone');

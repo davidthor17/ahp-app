@@ -124,7 +124,11 @@ test('every path that changes which audit is open calls the reset', () => {
   // this device remembers for this audit, then Full), so this pins the reset
   // call and the row still feeding it. The precedence itself is pinned in
   // tier-persistence.test.js, where it belongs.
-  assert.match(APP, /resetAuditScopedState\(\{\s*\n?\s*tier: tierForOpenAudit\(\{ rowTier: auditRow && auditRow\.tier, remembered: rememberedForThisAudit \}\),?\s*\n?\s*\}\)/, 'resume');
+  // Phase 7.3C gave the resume tier a precedence rule (published row, then what
+  // this device remembers for this audit, then the draft row, then Full), so
+  // this pins the reset call and the row still feeding it. The precedence
+  // itself is pinned in tier-precedence.test.js, where it belongs.
+  assert.match(APP, /resetAuditScopedState\(\{[\s\S]{0,500}tier: tierForOpenAudit\(\{[\s\S]{0,400}rowTier: auditRow && auditRow\.tier,[\s\S]{0,400}remembered: rememberedForThisAudit,/, 'resume');
   assert.match(APP, /resetAuditScopedState\(\{ tier: row\.tier \}\)/, 'reviewer open');
   assert.match(APP, /setIds\(newAuditIds\(\)\);\s*\n\s*resetAuditScopedState\(\);/, 'closing a reviewed audit');
   assert.equal(/\['desk', 'spot', 'full'\]\.includes\(auditRow\.tier\)/.test(APP), false,

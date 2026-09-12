@@ -50,10 +50,10 @@ function chooseTier(state, device, tier) {
  * Opening an audit: resume, reload or starting a new one. Reads the map and
  * the row, writes neither. The stale-closure write lived here and is gone.
  */
-function openAudit(state, device, auditId, { rowTier = null } = {}) {
+function openAudit(state, device, auditId, { rowTier = null, published = false } = {}) {
   state.auditId = auditId;
   const fresh = auditScopedReset({
-    tier: tierForOpenAudit({ rowTier, remembered: rememberedTier(device.tiersByAudit, auditId) }),
+    tier: tierForOpenAudit({ rowTier, remembered: rememberedTier(device.tiersByAudit, auditId), published }),
   });
   state.auditTier = fresh.auditTier;
   return fresh;
@@ -155,8 +155,10 @@ test('two audits hold their own tiers at once', () => {
 test('a published row\'s tier outranks anything remembered', () => {
   const device = { tiersByAudit: rememberTier(undefined, C, 'spot') };
   const state = session();
-  assert.equal(openAudit(state, device, C, { rowTier: 'full' }).auditTier, 'full');
+  assert.equal(openAudit(state, device, C, { rowTier: 'full', published: true }).auditTier, 'full');
   assert.equal(device.tiersByAudit[C], 'spot', 'and the device record is not rewritten by that');
+  // The same row, still a draft: its 'full' is a default and loses to Spot.
+  assert.equal(openAudit(state, device, C, { rowTier: 'full' }).auditTier, 'spot');
 });
 
 // ── the wiring ──────────────────────────────────────────────────────────────
