@@ -385,7 +385,11 @@ test('the refusal message names the problem in the auditor\'s words', () => {
   queueWrite(q, 'GHOST-99', 'morning', { status: 'met' }, AUDIT_A);
   markFailure(q, 'GHOST-99', 'morning', unknownItemError('GHOST-99'));
   const message = blockedMessage(blockedReasons(q));
-  assert.match(message, /checklist items this version of the console does not have/);
+  // Phase 7.3C. One refused change now reads in the singular throughout. The
+  // plural wording this used to assert is still what several produce, and both
+  // are pinned in refusal-grammar.test.js.
+  assert.match(message, /checklist item this version of the console does not have/);
+  assert.match(message, /1 change was refused/);
   assert.match(message, /Update the console/);
   assert.equal(/GHOST-99|UNKNOWN_ITEM/.test(message), false, 'no internal id, no code');
 });

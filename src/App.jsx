@@ -30,6 +30,7 @@ import {
   sendableEntries, blockedCount, blockedReasons, blockedMessage,
   markFailure, isPermanentError, withTimeout, isTimeoutError,
   serializeQueue, deserializeQueue, markForeignEntries, unknownItemError,
+  discardBlockedEntry, discardableEntries,
 } from "./framework/syncQueue.js";
 import {
   auditScopedReset, startAuditBlockers, startAuditMessage, newAuditIds,
@@ -71,6 +72,21 @@ import {
 // Stamped at build time by vite.config.js. Undefined under node --test, where
 // nothing reads it.
 const BUILD_TIME = typeof __BUILD_TIME__ === 'string' ? __BUILD_TIME__ : null;
+
+/**
+ * The refusals to offer a discard for, as plain rows the UI can name.
+ *
+ * Phase 7.3C. blockedReasons groups refusals into one sentence, which is right
+ * for the message and useless for a control that has to act on exactly one
+ * entry. This is the same queue read the other way: one row per refused cell,
+ * audit-scoped, carrying only what the bar renders.
+ */
+const refusedRows = (queue, auditId) =>
+  discardableEntries(queue, auditId).map((e) => ({
+    itemId: e.itemId,
+    shiftId: e.shiftId,
+    code: e.error ? e.error.code : null,
+  }));
 
 // Settings → API in your Supabase project → Project URL + anon public key.
 // Safe to expose in client code — access is governed by the RLS policies
@@ -208,6 +224,13 @@ export default function AHPAudit() {
   // one is "still going", the other is "will never go".
   const [blockedWrites, setBlockedWrites] = useState(0);
   const [blockedInfo, setBlockedInfo]     = useState([]);
+  // Phase 7.3C. The refused entries themselves, not only their count and their
+  // grouped reasons: a discard acts on one cell and has to name it, which an
+  // aggregated message cannot do.
+  const [refusedList, setRefusedList]     = useState([]);
+  // Which refusal is one tap away from being thrown away, as `itemId shiftId`.
+  // Null unless the auditor has asked: discarding a grade is never one tap.
+  const [confirmDiscard, setConfirmDiscard] = useState(null);
   const flushingRef                       = useRef(false);
   // Phase 6.4. Durable pending writes recovered from a previous session, shown
   // once so the auditor knows what just happened rather than wondering why the
@@ -721,6 +744,7 @@ export default function AHPAudit() {
               setPendingWrites(restoredCount);
               setBlockedWrites(blockedCount(restored.queue));
               setBlockedInfo(blockedReasons(restored.queue));
+              setRefusedList(refusedRows(restored.queue, cachedAuditId));
               setRestoredNotice(restoredCount);
             }
           }
@@ -1115,6 +1139,7 @@ export default function AHPAudit() {
       setPendingWrites(queuedCount(pendingRef.current));
       setBlockedWrites(blockedCount(pendingRef.current));
       setBlockedInfo(blockedReasons(pendingRef.current));
+      setRefusedList(refusedRows(pendingRef.current, auditId));
       setSyncState(transientFailure ? 'error' : 'synced');
       // A write that just succeeded must stop being durable the same way it
       // stops being pending: because the server took it, not because the tab
@@ -1146,6 +1171,7 @@ export default function AHPAudit() {
       setPendingWrites(queuedCount(pendingRef.current));
       setBlockedWrites(blockedCount(pendingRef.current));
       setBlockedInfo(blockedReasons(pendingRef.current));
+      setRefusedList(refusedRows(pendingRef.current, auditId));
       persistQueue(auditId);
       return;
     }
@@ -1160,6 +1186,35 @@ export default function AHPAudit() {
     if (!session || !auditId) return;
     flushPending(auditId);
   };
+
+  /**
+   * Throw one refusal away, because the auditor asked twice.
+   *
+   * Phase 7.3C. A refusal normally clears by re-editing the cell. An
+   * UNKNOWN_ITEM has no cell to edit, so before this an entry for an item the
+   * checklist no longer has sat at REFUSED for the life of the device, with
+   * the header permanently red and no action anywhere that could clear it.
+   *
+   * Deliberately not a "clear all": each one is named, and each one is a grade
+   * the auditor made, so each is thrown away on its own and only after the
+   * confirm step. Nothing here touches the server. The row this entry would
+   * have written was refused and never written, so there is nothing out there
+   * to delete, and this function has no client to delete it with.
+   */
+  const discardRefused = useCallback((itemId, shiftId) => {
+    const auditId = ids.auditId;
+    // Says no for anything still being retried, and for anything belonging to
+    // another audit. If it says no, nothing below runs.
+    if (!discardBlockedEntry(pendingRef.current, itemId, shiftId, auditId)) return;
+    setPendingWrites(queuedCount(pendingRef.current));
+    setBlockedWrites(blockedCount(pendingRef.current));
+    setBlockedInfo(blockedReasons(pendingRef.current));
+    setRefusedList(refusedRows(pendingRef.current, auditId));
+    setConfirmDiscard(null);
+    // Durable immediately, for the same reason a queued grade is: a discard
+    // the auditor confirmed must not come back on the next reload.
+    persistQueue(auditId);
+  }, [ids.auditId, persistQueue]);
 
   // Four things restart a stalled queue: a session arriving or returning after
   // a refresh, the audit row being created, the device coming back online, and
@@ -1412,6 +1467,10 @@ export default function AHPAudit() {
   const toggleRoomType = (rt) => setProp(p => ({ ...p, roomTypes: p.roomTypes.includes(rt) ? p.roomTypes.filter(x => x !== rt) : [...p.roomTypes, rt] }));
 
   const setStatus = (itemId, status, naReason = null) => {
+    // Phase 7.3C. An item outside this property's tier, or outside this audit's
+    // frozen checklist, is not gradable. The buttons are disabled; this is what
+    // makes that a fact about the write path rather than a fact about the UI.
+    if (!isItemApplicable(itemId)) return;
     const prev = audit[itemId] || {};
     const shiftPrev = prev[activeShiftId] || {};
     const time = shiftPrev.time || nowTime();
@@ -1468,6 +1527,9 @@ export default function AHPAudit() {
   };
 
   const toggleCritical = (itemId) => {
+    // Phase 7.3C. Same rule as setStatus: this writes a patch, so it is a
+    // grading control and an out-of-tier item may not reach it.
+    if (!isItemApplicable(itemId)) return;
     const prev = audit[itemId] || {};
     const shiftPrev = prev[activeShiftId] || {};
     const critical = !shiftPrev.critical;
@@ -2032,6 +2094,44 @@ export default function AHPAudit() {
       }}>
         <strong style={{ fontWeight: '700' }}>Not saved to Specula. </strong>
         {refusedMessage}
+        {/* One row per refused change. There is no "discard everything" here
+            on purpose: each row is a grade somebody stood in a hotel and made,
+            and throwing them all away should never be one tap. */}
+        {refusedList.map((e) => {
+          const key = `${e.itemId} ${e.shiftId}`;
+          const meta = ITEM_INDEX[e.itemId];
+          const confirming = confirmDiscard === key;
+          return (
+            <div key={key} style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }}>
+              <span style={{ fontWeight: '700' }}>{e.itemId}</span>
+              {meta && <span style={{ opacity: 0.85 }}>{meta.label}</span>}
+              {confirming ? (
+                <>
+                  <span style={{ opacity: 0.9 }}>Discard this change? It will not be saved.</span>
+                  <button onClick={() => discardRefused(e.itemId, e.shiftId)} style={{
+                    background: 'rgba(224,85,85,0.18)', border: '1px solid rgba(224,85,85,0.5)',
+                    borderRadius: '6px', padding: '4px 10px', color: '#E05555',
+                    fontSize: '11px', fontWeight: '700', letterSpacing: '0.04em',
+                    cursor: 'pointer', fontFamily: 'inherit', minHeight: '30px',
+                  }}>Discard</button>
+                  <button onClick={() => setConfirmDiscard(null)} style={{
+                    background: 'transparent', border: `1px solid ${C.border}`,
+                    borderRadius: '6px', padding: '4px 10px', color: C.dim,
+                    fontSize: '11px', fontWeight: '600', cursor: 'pointer',
+                    fontFamily: 'inherit', minHeight: '30px',
+                  }}>Keep</button>
+                </>
+              ) : (
+                <button onClick={() => setConfirmDiscard(key)} style={{
+                  marginLeft: 'auto', background: 'transparent',
+                  border: '1px solid rgba(224,85,85,0.4)', borderRadius: '6px',
+                  padding: '4px 10px', color: '#E05555', fontSize: '11px',
+                  fontWeight: '600', cursor: 'pointer', fontFamily: 'inherit', minHeight: '30px',
+                }}>Discard</button>
+              )}
+            </div>
+          );
+        })}
       </div>
     );
   };
@@ -3295,8 +3395,15 @@ export default function AHPAudit() {
                         }}>⚑ Critical</span>
                       ) : null
                     ) : (
-                      <button onClick={() => toggleCritical(item.id)} style={{
-                        fontSize: '10px', fontWeight: '700', letterSpacing: '0.04em', cursor: 'pointer',
+                      <button
+                        // Phase 7.3C. This one did not merely swallow the tap: it
+                        // wrote. Flagging an out-of-tier item critical queued a real
+                        // patch for an item the audit does not contain.
+                        disabled={!applicable}
+                        aria-disabled={!applicable}
+                        onClick={() => applicable && toggleCritical(item.id)}
+                        style={{
+                        fontSize: '10px', fontWeight: '700', letterSpacing: '0.04em', cursor: applicable ? 'pointer' : 'default',
                         color: activeData.critical ? '#E05555' : C.muted,
                         background: activeData.critical ? 'rgba(224,85,85,0.12)' : 'transparent',
                         border: `1px solid ${activeData.critical ? 'rgba(224,85,85,0.4)' : C.border}`,
@@ -3346,7 +3453,18 @@ export default function AHPAudit() {
                   {Object.entries(STATUS).map(([key, scfg]) => {
                     const active = activeData.status === key;
                     return (
-                      <button key={key} onClick={() => applicable && (key === 'na' ? requestNa(item.id) : setStatus(item.id, key))} style={{
+                      <button
+                        key={key}
+                        // Phase 7.3C. Genuinely disabled, not merely ignored. These
+                        // rendered as live buttons that swallowed every tap, which
+                        // reads as a broken app rather than an item out of tier, and
+                        // cost a real test run before anyone noticed. disabled stops
+                        // pointer, keyboard and touch alike; the guard in the handler
+                        // and the one in setStatus stay as the lines behind it.
+                        disabled={!applicable}
+                        aria-disabled={!applicable}
+                        onClick={() => applicable && (key === 'na' ? requestNa(item.id) : setStatus(item.id, key))}
+                        style={{
                         flex: 1, padding: '8px 4px', borderRadius: '7px',
                         border: `1px solid ${active ? scfg.color : C.border}`,
                         background: active ? scfg.bg : 'transparent',

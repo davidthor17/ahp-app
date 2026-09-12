@@ -221,6 +221,46 @@ export const blockedEntries = (queue) => pendingEntries(queue).filter((e) => e.b
 
 export const blockedCount = (queue) => blockedEntries(queue).length;
 
+/**
+ * The refusals this audit may be offered a discard for.
+ *
+ * Blocked only, and belonging here only. Work that is still being retried is
+ * not the auditor's to throw away, and another audit's refusal is that audit's
+ * business, not this one's.
+ */
+export const discardableEntries = (queue, auditId = null) =>
+  blockedEntries(queue).filter((e) => entryBelongsTo(e, auditId));
+
+/**
+ * Discard one permanently refused entry, because the auditor said so.
+ *
+ * Phase 7.3C. The ordinary way a refusal clears is re-editing the cell:
+ * queueWrite replaces the entry and the flush tries it again. An UNKNOWN_ITEM
+ * has no cell to edit, because the item is not in this build's checklist at
+ * all, so that route does not exist and the entry stays REFUSED for as long as
+ * the device does. This is the way out, and it is deliberately narrow:
+ *
+ *   - only an entry already blocked, never pending or retrying work
+ *   - only an entry belonging to the audit asking
+ *   - local only. The row this entry would have written was never written, so
+ *     there is nothing on the server to delete and nothing here tries to.
+ *
+ * Returns whether anything went, so a caller can tell "discarded" from
+ * "refused to discard" rather than assuming.
+ */
+export function discardBlockedEntry(queue, itemId, shiftId, auditId = null) {
+  const key = writeKey(itemId, shiftId);
+  const entry = queue.get(key);
+  if (!entry) return false;
+  // The load-bearing guard. A pending or retrying write is on its way and the
+  // server has not refused it; discarding that would lose a grade silently,
+  // which is the one outcome this whole queue exists to prevent.
+  if (!entry.blocked) return false;
+  if (!entryBelongsTo(entry, auditId)) return false;
+  queue.delete(key);
+  return true;
+}
+
 export const hasPending = (queue) => queue.size > 0;
 
 /** The distinct reasons behind the blocked entries, for one honest message. */
@@ -286,22 +326,34 @@ export function blockedMessage(reasons = []) {
   if (!reasons.length) return null;
   const items = reasons.reduce((n, r) => n + (r.items ? r.items.length : 0), 0);
   const first = reasons[0];
-  const scope = `${items} change${items === 1 ? '' : 's'}`;
+  // Phase 7.3C. One refusal is the commonest case in the field and it read
+  // "1 change were refused", which is the first thing an auditor sees when
+  // something has gone wrong. Agreement is carried explicitly here, the way
+  // startAuditMessage and blockerMessage already carry it.
+  const one = items === 1;
+  const scope = `${items} change${one ? '' : 's'}`;
+  const was = one ? 'was' : 'were';
   if (first.code === '42501') {
-    return `${scope} were refused because this audit belongs to another auditor. Your grades are still on this device. Ask them to publish it, or start your own audit for this property.`;
+    return `${scope} ${was} refused because this audit belongs to another auditor. Your grades are still on this device. Ask them to publish it, or start your own audit for this property.`;
   }
   if (first.code === '23503') {
-    return `${scope} were refused because this audit no longer exists in Specula. Your grades are still on this device. Do not close the app.`;
+    return `${scope} ${was} refused because this audit no longer exists in Specula. Your grades are still on this device. Do not close the app.`;
   }
   if (first.code === UNKNOWN_ITEM_CODE) {
-    return `${scope} were refused because they are for checklist items this version of the console does not have. Update the console, then re-enter them.`;
+    // Both halves of the sentence move together: the subject, and the item it
+    // refers back to at the end.
+    return one
+      ? `${scope} was refused because it is for a checklist item this version of the console does not have. Update the console, then re-enter it.`
+      : `${scope} were refused because they are for checklist items this version of the console does not have. Update the console, then re-enter them.`;
   }
   if (first.code === FOREIGN_ENTRY_CODE) {
-    return `${scope} were made in a different audit and were not saved to this one. Open that audit again to send them.`;
+    return one
+      ? `${scope} was made in a different audit and was not saved to this one. Open that audit again to send it.`
+      : `${scope} were made in a different audit and were not saved to this one. Open that audit again to send them.`;
   }
   // Phase 7.3. No raw database text. The code is still kept on the entry for
   // diagnostics; what an auditor is shown is a sentence they can act on.
-  return `${scope} were refused by Specula and will not be retried. Contact Specula with this audit's reference.`;
+  return `${scope} ${was} refused by Specula and will not be retried. Contact Specula with this audit's reference.`;
 }
 
 /**
