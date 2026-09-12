@@ -226,6 +226,20 @@ export const MAX_EDGE_PX = 1600;
 export const JPEG_QUALITY = 0.72;
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 
+/**
+ * How long one photo may take before the upload is abandoned.
+ *
+ * Phase 7.3. Every other write in this app has been bounded since Phase 6.1;
+ * the photo path was the one that was not. A hung upload left the photo
+ * UPLOADING forever, which cannot be deleted (the outcome is unknown) and
+ * cannot be retried (it is not FAILED), while UNSAVED_PHOTOS held the publish
+ * gate shut. The auditor could neither finish nor clear it.
+ *
+ * Longer than an item write, because this is a file over hotel wifi rather
+ * than one row, and still bounded, because unbounded is what trapped them.
+ */
+export const PHOTO_UPLOAD_TIMEOUT_MS = 45000;
+
 export function targetDimensions(width, height, maxEdge = MAX_EDGE_PX) {
   if (!width || !height) return null;
   const longest = Math.max(width, height);

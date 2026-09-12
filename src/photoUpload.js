@@ -13,7 +13,9 @@
 import {
   EVIDENCE_BUCKET, storagePath, pathBelongsToAudit, targetDimensions,
   MAX_EDGE_PX, JPEG_QUALITY, validateFile, normalisePhotoNote,
+  PHOTO_UPLOAD_TIMEOUT_MS,
 } from './framework/photoEvidence.js';
+import { withTimeout, isTimeoutError } from './framework/syncQueue.js';
 
 /**
  * Downscale a camera file to something an audit can actually upload.
@@ -92,6 +94,7 @@ async function ensureItemRow(supabase, { auditId, itemId, shiftId, sectionId, la
  */
 export async function uploadPhoto(supabase, {
   auditId, itemId, shiftId, sectionId, label, photoId, blob, mimeType, width, height, uploadedBy, note,
+  timeoutMs = PHOTO_UPLOAD_TIMEOUT_MS,
 }) {
   const check = validateFile(blob);
   if (!check.ok) return { ok: false, error: check.reason };
@@ -104,38 +107,71 @@ export async function uploadPhoto(supabase, {
     return { ok: false, error: 'That photo does not belong to this audit.' };
   }
 
+  // Phase 7.3. Every step is bounded, like every other write in the app. An
+  // unbounded photo upload left the photo UPLOADING for good: undeletable,
+  // unretryable, and holding the publish gate shut. A timeout is a failure
+  // like any other, so the photo becomes FAILED, which the auditor can retry
+  // or remove.
   try {
-    await ensureItemRow(supabase, { auditId, itemId, shiftId, sectionId, label });
+    await withTimeout(
+      () => ensureItemRow(supabase, { auditId, itemId, shiftId, sectionId, label }),
+      { timeoutMs },
+    );
   } catch (e) {
-    return { ok: false, error: 'The item could not be saved, so the photo was not attached.' };
+    return isTimeoutError(e)
+      ? { ok: false, timedOut: true, error: 'Saving the item took too long, so the photo was not attached. Try again.' }
+      : { ok: false, error: 'The item could not be saved, so the photo was not attached.' };
   }
 
-  const { error: upErr } = await supabase.storage
-    .from(EVIDENCE_BUCKET)
-    .upload(path, blob, { contentType: mimeType, upsert: false });
+  let upErr = null;
+  try {
+    const res = await withTimeout(
+      () => supabase.storage.from(EVIDENCE_BUCKET).upload(path, blob, { contentType: mimeType, upsert: false }),
+      { timeoutMs },
+    );
+    upErr = res && res.error ? res.error : null;
+  } catch (e) {
+    if (isTimeoutError(e)) {
+      // Nothing is known to have been stored, and nothing claims it was. If the
+      // file did land, it is unreferenced: recoverable, and honest.
+      return { ok: false, timedOut: true, error: 'The photo took too long to upload. It is still on this device. Try again.' };
+    }
+    upErr = e;
+  }
   if (upErr) {
     return { ok: false, error: 'The photo could not be uploaded.' };
   }
 
-  const { data, error: metaErr } = await supabase
-    .from('audit_item_photos')
-    .insert({
-      id: photoId,
-      audit_id: auditId,
-      item_id: itemId,
-      shift_id: shiftId,
-      storage_path: path,
-      mime_type: mimeType,
-      byte_size: blob.size ?? null,
-      width: width ?? null,
-      height: height ?? null,
-      uploaded_by: uploadedBy || null,
-      // Written with the insert rather than after it, so a caption typed before
-      // the upload finished cannot be lost between the two writes.
-      note: normalisePhotoNote(note),
-    })
-    .select('id, storage_path, created_at, note')
-    .single();
+  let data = null;
+  let metaErr = null;
+  try {
+    const res = await withTimeout(
+      () => supabase
+        .from('audit_item_photos')
+        .insert({
+          id: photoId,
+          audit_id: auditId,
+          item_id: itemId,
+          shift_id: shiftId,
+          storage_path: path,
+          mime_type: mimeType,
+          byte_size: blob.size ?? null,
+          width: width ?? null,
+          height: height ?? null,
+          uploaded_by: uploadedBy || null,
+          // Written with the insert rather than after it, so a caption typed
+          // before the upload finished cannot be lost between the two writes.
+          note: normalisePhotoNote(note),
+        })
+        .select('id, storage_path, created_at, note')
+        .single(),
+      { timeoutMs },
+    );
+    data = res && res.data ? res.data : null;
+    metaErr = res && res.error ? res.error : null;
+  } catch (e) {
+    metaErr = e;
+  }
 
   if (metaErr || !data) {
     // The file is up and nothing references it. Take it back down so the
@@ -143,7 +179,9 @@ export async function uploadPhoto(supabase, {
     // fails the file is unreferenced, which is recoverable and honest; what
     // matters is that the caller is told the photo was NOT saved.
     try { await supabase.storage.from(EVIDENCE_BUCKET).remove([path]); } catch (e) { /* orphan */ }
-    return { ok: false, error: 'The photo uploaded but could not be recorded.' };
+    return isTimeoutError(metaErr)
+      ? { ok: false, timedOut: true, error: 'Recording the photo took too long, so it was not attached. It is still on this device. Try again.' }
+      : { ok: false, error: 'The photo uploaded but could not be recorded.' };
   }
 
   return {

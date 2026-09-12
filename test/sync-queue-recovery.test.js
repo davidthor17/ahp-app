@@ -279,11 +279,20 @@ test('a missing audit is explained differently, because the remedy differs', () 
   assert.match(msg, /Do not close the app/);
 });
 
-test('an unrecognised refusal still reports the real message', () => {
+test('an unrecognised refusal is reported without database text', () => {
+  // Phase 7.3 reverses the earlier judgement here deliberately. Reporting the
+  // Postgres message verbatim was chosen as the truth even when it was jargon,
+  // and the truth is still the right goal: "null value in column label
+  // violates not-null constraint" simply is not a truth an auditor standing in
+  // a hotel corridor can act on. The code stays on the entry for diagnostics,
+  // and what they read is a sentence with a next step in it.
   const q = queueOf(1);
   markFailure(q, 'RM-01', 'day', NOTNULL);
   const msg = blockedMessage(blockedReasons(q));
-  assert.match(msg, /not-null constraint/, 'the truth, even when it is jargon');
+  assert.equal(/not-null|constraint|violates|column|null value/i.test(msg), false, 'no raw database text');
+  assert.match(msg, /will not be retried/, 'it still says the queue has given up on this one');
+  assert.match(msg, /Contact Specula/, 'and what to do about it');
+  assert.equal(blockedReasons(q)[0].code, NOTNULL.code, 'the code survives for diagnostics');
 });
 
 test('nothing blocked produces no message at all', () => {

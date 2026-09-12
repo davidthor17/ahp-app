@@ -107,7 +107,10 @@ test('defect 1 reproduced: a later success cannot mask an earlier failure', () =
 test('the label counts what is outstanding, so the number is visible', () => {
   assert.equal(syncLabel(SYNC.SYNCED).text, 'SYNCED');
   assert.equal(syncLabel(SYNC.PENDING, 3).text, 'SAVING 3');
-  assert.equal(syncLabel(SYNC.ERROR, 2).text, 'UNSAVED 2');
+  // Phase 7.3. A transient failure with work still outstanding is being
+  // retried: on the next grade, the next reconnection, and every tick. UNSAVED
+  // read as though the app had given up on it.
+  assert.equal(syncLabel(SYNC.ERROR, 2).text, 'RETRYING 2');
   assert.equal(syncLabel(SYNC.SIGNED_OUT, 5).text, 'SIGNED OUT 5');
   assert.equal(syncLabel(SYNC.SIGNED_OUT, 0).text, 'SIGNED OUT');
 });

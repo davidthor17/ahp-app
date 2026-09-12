@@ -29,8 +29,12 @@ import {
   pendingEntries, resolveSyncState, syncLabel, applyPending,
   sendableEntries, blockedCount, blockedReasons, blockedMessage,
   markFailure, isPermanentError, withTimeout, isTimeoutError,
-  serializeQueue, deserializeQueue,
+  serializeQueue, deserializeQueue, markForeignEntries, unknownItemError,
 } from "./framework/syncQueue.js";
+import {
+  auditScopedReset, startAuditBlockers, startAuditMessage, newAuditIds,
+  mergeDeviceState, tierForAudit,
+} from "./framework/auditSession.js";
 import {
   UPDATE_STATE, updateBannerState, updateBannerText, buildAgeDays,
   shouldShowUpdateBanner,
@@ -108,6 +112,22 @@ const C = {
 
 const STORAGE_KEY = 'ahp_v3';
 const nowTime = () => new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+
+// The property a new audit starts from. Extracted so starting the next audit
+// uses exactly the same blank the app opens with, rather than carrying the last
+// hotel's details into a fresh property row.
+const blankProperty = () => ({
+  name: '', city: '', country: '', chain: false, chainName: '',
+  category: '4★', roomCount: '', roomTypes: [],
+  hasPool: false, poolCapacity: '', poolCount: '1',
+  hasSpa: false,
+  // Sub-features that gate a single item rather than a whole section. They
+  // default to present, so a question nobody has answered yet never quietly
+  // removes an item from the audit.
+  hasSauna: true, hasChangingRooms: true, hasMinibar: true, hasLunchService: true, hasGym: true,
+  hasRestaurant: false, fbCapacity: '', menuVariety: '', menuComplexity: '', authenticCuisine: false, hasWineList: false,
+  shiftCount: '3', rotationPattern: '2-2-3', shiftTimes: {},
+});
 
 // prop (camelCase, UI state) -> properties table row (snake_case)
 const propToRow = (p, userId) => ({
@@ -233,18 +253,7 @@ export default function AHPAudit() {
     } catch (e) {}
   }, [photos]);
   const [ids, setIds]                     = useState({ propertyId: null, auditId: null, auditRef: null });
-  const [prop, setProp]                   = useState({
-    name: '', city: '', country: '', chain: false, chainName: '',
-    category: '4★', roomCount: '', roomTypes: [],
-    hasPool: false, poolCapacity: '', poolCount: '1',
-    hasSpa: false,
-    // Sub-features that gate a single item rather than a whole section. They
-    // default to present, so a question nobody has answered yet never quietly
-    // removes an item from the audit.
-    hasSauna: true, hasChangingRooms: true, hasMinibar: true, hasLunchService: true, hasGym: true,
-    hasRestaurant: false, fbCapacity: '', menuVariety: '', menuComplexity: '', authenticCuisine: false, hasWineList: false,
-    shiftCount: '3', rotationPattern: '2-2-3', shiftTimes: {},
-  });
+  const [prop, setProp]                   = useState(blankProperty());
   const [activeShiftId, setActiveShiftId] = useState('morning');
   const [activeSection, setActiveSection] = useState(null);
   // Set when a section is opened from a finding, so the item can be scrolled to
@@ -323,6 +332,48 @@ export default function AHPAudit() {
   const [legacyAck, setLegacyAck]         = useState(false);
   useEffect(() => { auditTierRef.current = auditTier; }, [auditTier]);
 
+  /**
+   * Leave one audit behind completely before taking on another.
+   *
+   * Phase 7.3. Three load paths each replaced some of this and none replaced
+   * all of it, so what was left over followed the auditor into the next audit.
+   * Four of those leftovers are published: the summary typed for another hotel,
+   * a tier a draft row does not carry, an acknowledgement given for a different
+   * audit, and evidence that would upload against whichever audit id was
+   * current when it finally sent. The list of what is audit-scoped lives in
+   * framework/auditSession.js, so it is one list rather than one guard per
+   * call site.
+   */
+  const resetAuditScopedState = useCallback((next = {}) => {
+    const fresh = auditScopedReset({ tier: next.tier });
+    // Previews are the one thing a reset has to release rather than drop: the
+    // object URLs belong to blobs the next audit will never look at.
+    for (const list of Object.values(photosRef.current || {})) {
+      for (const photo of list || []) {
+        if (photo && photo.previewUrl) { try { URL.revokeObjectURL(photo.previewUrl); } catch (e) { /* already gone */ } }
+      }
+    }
+    photosRef.current = fresh.photos;
+    pendingCaptionsRef.current = fresh.pendingCaptions;
+    setPhotos(fresh.photos);
+    setPhotoOpen(fresh.photoOpen);
+    setPhotoNotice(fresh.photoNotice);
+    setLightbox(fresh.lightbox);
+    setSummaryDraft(fresh.summaryDraft);
+    setLegacyAck(fresh.legacyAck);
+    auditTierRef.current = fresh.auditTier;
+    setAuditTier(fresh.auditTier);
+    setPublishState(fresh.publishState);
+    setPublishReason(fresh.publishReason);
+    setPublication(fresh.publication);
+    setPublicToken(fresh.publicToken);
+    setClientReportMeta(fresh.clientReportMeta);
+    setNaPrompt(fresh.naPrompt);
+    setOpenNotes(fresh.openNotes);
+    setFocusItemId(fresh.focusItemId);
+    setSectionReturn(fresh.sectionReturn);
+  }, []);
+
   // Watch for new builds. This only ever sets a flag: nothing here reloads the
   // app, and the reload the banner offers is refused while writes are unsaved.
   useEffect(() => {
@@ -337,6 +388,8 @@ export default function AHPAudit() {
   const [browseLoading, setBrowseLoading] = useState(false);
   const [browseError, setBrowseError]     = useState(false); // the list failed to load
   const [openError, setOpenError]         = useState(false); // one audit failed to open
+  // Why starting the next audit was refused. Never a gate on anything else.
+  const [startError, setStartError]       = useState(null);
   const [reviewAuditId, setReviewAuditId] = useState(null);
   const [reviewMeta, setReviewMeta]       = useState(null); // { ref, date, status, tier }
 
@@ -448,6 +501,9 @@ export default function AHPAudit() {
       // null explicitly is what matters — leaving the previous audit's snapshot
       // in state would score this one against another property's basis.
       adoptAudit(nextAudit, null);
+      // Nothing from the audit being left behind, including its evidence: a
+      // photo still on this device would otherwise appear on this one.
+      resetAuditScopedState({ tier: row.tier });
       setIds({ propertyId: row.property_id, auditId: row.id, auditRef: row.ref });
       setReviewMeta({ ref: row.ref, date: row.date, status: row.status, tier: row.tier });
       setReviewAuditId(row.id);
@@ -557,13 +613,12 @@ export default function AHPAudit() {
       setProp(nextProp);
       adoptAudit(nextAudit, rowSnapshot);
       setIds(nextIds);
-      if (auditRow && auditRow.tier && ['desk', 'spot', 'full'].includes(auditRow.tier)) {
-        auditTierRef.current = auditRow.tier;
-        setAuditTier(auditRow.tier);
-      }
-      // A different audit is being taken up. Whatever the last one's publish
-      // attempt left behind says nothing about this one; the row does.
-      setPublishState(PUBLISH_STATE.IDLE);
+      // A different audit is being taken up. Everything the last one left
+      // behind goes with it, including the tier: a draft row carries none, and
+      // keeping the previous audit's is how a Spot Audit became a Full one.
+      resetAuditScopedState({ tier: auditRow && auditRow.tier });
+      // Whatever this session remembers about publishing says nothing about
+      // this audit; the row does.
       setPublication(serverPublication(auditRow));
       setReviewAuditId(null);
       setReviewMeta(null);
@@ -583,7 +638,8 @@ export default function AHPAudit() {
   const closeReviewAudit = () => {
     setReviewAuditId(null);
     setReviewMeta(null);
-    setIds({ propertyId: null, auditId: null, auditRef: null });
+    setIds(newAuditIds());
+    resetAuditScopedState();
     // Clears the basis along with the audit. Left behind, it would follow the
     // reviewer into the next audit they open.
     adoptAudit({}, null);
@@ -726,10 +782,13 @@ export default function AHPAudit() {
         }
         // The tier the row already carries outranks whatever this session
         // started with. It is written at publish, so before then it is null and
-        // this leaves the local choice alone.
-        if (auditRow && auditRow.tier && ['desk', 'spot', 'full'].includes(auditRow.tier)) {
-          auditTierRef.current = auditRow.tier;
-          setAuditTier(auditRow.tier);
+        // this leaves the local choice alone. What counts as a tier is decided
+        // in one place, framework/auditSession.js, rather than by an inline
+        // list here and another one there.
+        if (auditRow && auditRow.tier) {
+          const rowTier = tierForAudit(auditRow.tier, auditTierRef.current);
+          auditTierRef.current = rowTier;
+          setAuditTier(rowTier);
         }
         // Phase 7.1. Reloading an audit that was already published left this
         // session believing it was a draft and offered PUBLISH again. The row
@@ -757,12 +816,18 @@ export default function AHPAudit() {
     // time this runs rather than passed in: a caller mid-edit already has the
     // newest grade in `a`, and the queue is what proves it also reached the
     // outstanding-writes list, not just the screen.
+    // Phase 7.3. Read-modify-write, like persistQueue already was. This used to
+    // replace the whole blob, and pendingCaptions is written by a different
+    // effect, so every grade, note or property edit erased the caption text
+    // that had just been made durable.
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const previous = raw ? JSON.parse(raw) : {};
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(mergeDeviceState(previous, {
         prop: p, audit: a, ids: i, snapshot: snapshotRef.current,
         trailQueue: trailRef.current, auditTier: auditTierRef.current,
         pendingQueue: serializeQueue(pendingRef.current, i && i.auditId),
-      }));
+      })));
     } catch(e) {}
   }, []);
 
@@ -782,6 +847,48 @@ export default function AHPAudit() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
     } catch (e) {}
   }, []);
+
+  /**
+   * Start the next hotel's audit.
+   *
+   * Phase 7.3. There was no way to do this at all. ensureRemoteAudit reuses
+   * ids.auditId whenever one exists and nothing cleared it, so the only route a
+   * field auditor would find after publishing was Edit, change the property,
+   * BEGIN AUDIT. That keeps the published audit's id and rewrites the published
+   * audit's property row: the next hotel's grades land on the last hotel's
+   * audit, and for a report still rendered from live rows, the client's report
+   * changes underneath them.
+   *
+   * Clearing the ids is what makes the next audit a new audit, because
+   * ensureRemoteAudit inserts a row precisely when there is no auditId to
+   * reuse. Refused while anything is outstanding, for the same reason resuming
+   * is: that work belongs to the audit being left behind.
+   */
+  const startNewAudit = useCallback(() => {
+    const blockers = startAuditBlockers({
+      pendingWrites: queuedCount(pendingRef.current),
+      blockedWrites: blockedCount(pendingRef.current),
+      unsavedPhotos: totalUnsavedPhotos(photosRef.current),
+    });
+    if (blockers.length > 0) { setStartError(startAuditMessage(blockers[0])); return; }
+    setStartError(null);
+    setReviewAuditId(null);
+    setReviewMeta(null);
+    const fresh = blankProperty();
+    const nextIds = newAuditIds();
+    setIds(nextIds);
+    resetAuditScopedState();
+    adoptAudit({}, null);
+    setProp(fresh);
+    setActiveSection(null);
+    setActiveShiftId(SHIFT_SYSTEMS['3'].shifts[0].id);
+    setOpenError(false);
+    // The device cache follows immediately, so a reload lands on the new audit
+    // rather than back on the published one it was started from.
+    persist(fresh, {}, nextIds);
+    setScreen('setup');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetAuditScopedState, adoptAudit, persist]);
 
   // Changing the tier is a change to the audit, and it is usually the last
   // thing done before publishing. Nothing else calls persist() at that point,
@@ -843,6 +950,11 @@ export default function AHPAudit() {
     if (flushingRef.current) return;          // one flush at a time
     flushingRef.current = true;
     let transientFailure = false;
+    // Phase 7.3. Anything belonging to another audit is refused before a single
+    // request is made. The entry is kept and reported like any other refusal,
+    // so a grade can never be written to an audit it was not made in, and can
+    // never be quietly discarded either.
+    markForeignEntries(pendingRef.current, auditId);
     try {
       // Only entries that are not already known to be refused. A blocked one
       // stays in the queue and is reported, but is stepped over rather than
@@ -854,10 +966,7 @@ export default function AHPAudit() {
           // Not discarded. An id the catalogue no longer knows is a refusal
           // like any other, and dropping the auditor's grade silently is the
           // one outcome that must never happen.
-          markFailure(pendingRef.current, itemId, shiftId, {
-            code: 'UNKNOWN_ITEM', permanent: true,
-            message: `${itemId} is not in this version of the checklist.`,
-          });
+          markFailure(pendingRef.current, itemId, shiftId, unknownItemError(itemId));
           continue;
         }
 
@@ -922,8 +1031,21 @@ export default function AHPAudit() {
    */
   const pushItem = (auditId, itemId, shiftId, patch) => {
     if (readOnly) return;
-    if (!ITEM_INDEX[itemId]) return;
-    queueWrite(pendingRef.current, itemId, shiftId, patch);
+    // The audit id travels with the entry, so a flush can never write this
+    // grade to a different audit than the one it was made in.
+    queueWrite(pendingRef.current, itemId, shiftId, patch, auditId);
+    // Phase 7.3. An id this build's checklist does not have used to return
+    // here, which dropped the auditor's grade without a queue entry, a count or
+    // a word on screen. It is refused instead, exactly as the flush refuses
+    // one: retained, surfaced, and never silently gone.
+    if (!ITEM_INDEX[itemId]) {
+      markFailure(pendingRef.current, itemId, shiftId, unknownItemError(itemId));
+      setPendingWrites(queuedCount(pendingRef.current));
+      setBlockedWrites(blockedCount(pendingRef.current));
+      setBlockedInfo(blockedReasons(pendingRef.current));
+      persistQueue(auditId);
+      return;
+    }
     setPendingWrites(queuedCount(pendingRef.current));
     // Durable the instant it is queued, before anything is attempted. This is
     // the Phase 6.4 rule applied at its one load-bearing point: a grade is
@@ -2483,7 +2605,12 @@ export default function AHPAudit() {
             {readOnly ? (
               <button onClick={closeReviewAudit} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>All audits</button>
             ) : (
-              <button onClick={() => setScreen('setup')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Edit</button>
+              <>
+                <button onClick={() => setScreen('setup')} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>Edit</button>
+                {/* The next hotel. Edit changes this audit's property; this
+                    leaves it alone and begins a new one. */}
+                <button onClick={startNewAudit} style={{ background: 'none', border: 'none', color: C.dim, cursor: 'pointer', fontSize: '13px', padding: 0 }}>New audit</button>
+              </>
             )}
             {session ? (
               <button onClick={signOut} style={{ background: 'none', border: 'none', color: C.muted, cursor: 'pointer', fontSize: '12px', padding: 0 }}>Sign out</button>
@@ -2500,6 +2627,13 @@ export default function AHPAudit() {
             {pendingWrites > 0
               ? `You are signed out. ${pendingWrites} change${pendingWrites === 1 ? '' : 's'} on this device ${pendingWrites === 1 ? 'has' : 'have'} not been saved to Specula. Sign in to send ${pendingWrites === 1 ? 'it' : 'them'}.`
               : 'You are signed out. Nothing is being saved to Specula. Sign in to continue.'}
+          </div>
+        )}
+        {/* Why the next audit cannot be started yet. Dismissable, and never a
+            gate on anything else on this screen. */}
+        {startError && (
+          <div onClick={() => setStartError(null)} style={{ padding: '9px 16px', background: C.warnBg, borderBottom: '1px solid rgba(245,166,35,0.3)', fontSize: '12px', color: C.warn, lineHeight: '1.45', cursor: 'pointer' }}>
+            {startError}
           </div>
         )}
         <UpdateBar />
@@ -2949,6 +3083,22 @@ export default function AHPAudit() {
                 <div style={{ padding: '12px 14px', borderRadius: '8px', background: C.surface2, border: `1px solid ${C.border}`, fontFamily: "'IBM Plex Mono', monospace", fontSize: '12px', color: C.dim, wordBreak: 'break-all' }}>
                   {publicReportLink({ publicToken, ref: ids.auditRef })}
                 </div>
+              )}
+              {/* The moment the next audit actually begins. Without this the
+                  only route onward was Edit, which would have carried on
+                  grading the audit just published. */}
+              {!readOnly && (
+                <>
+                  <button onClick={startNewAudit} style={{
+                    width: '100%', minHeight: '48px', marginTop: '14px', padding: '12px',
+                    borderRadius: '10px', border: `1px solid ${C.goldBorder || C.border}`,
+                    background: 'transparent', color: C.gold, fontSize: '13px', fontWeight: '700',
+                    letterSpacing: '0.06em', cursor: 'pointer', fontFamily: 'inherit',
+                  }}>START A NEW AUDIT</button>
+                  {startError && (
+                    <div style={{ marginTop: '8px', fontSize: '12px', color: C.warn, lineHeight: '1.5' }}>{startError}</div>
+                  )}
+                </>
               )}
             </div>
           )}

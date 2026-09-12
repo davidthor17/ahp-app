@@ -97,7 +97,7 @@ export const writeKey = (itemId, shiftId) => `${itemId} ${shiftId}`;
 /** A fresh queue. A Map, so insertion order is the order of the retry. */
 export const createQueue = () => new Map();
 
-export function queueWrite(queue, itemId, shiftId, patch) {
+export function queueWrite(queue, itemId, shiftId, patch, auditId = null) {
   const key = writeKey(itemId, shiftId);
   const existing = queue.get(key);
   // A re-edit of a blocked cell is a new attempt at it, not a repeat of the
@@ -105,6 +105,11 @@ export function queueWrite(queue, itemId, shiftId, patch) {
   // the previous payload is cleared and it is tried again.
   queue.set(key, {
     itemId, shiftId, patch,
+    // Phase 7.3. The audit this grade was made in, carried by the entry itself.
+    // The flush used to write whatever was outstanding to whichever audit was
+    // open when it ran, so the binding lived in a guard elsewhere rather than
+    // in the record. See markForeignEntries.
+    auditId: auditId || (existing ? existing.auditId || null : null),
     attempts: existing ? existing.attempts || 0 : 0,
     error: null,
     blocked: false,
@@ -136,6 +141,65 @@ export function markFailure(queue, itemId, shiftId, error) {
   });
   return queue;
 }
+
+/**
+ * A grade may only be written to the audit it was made in.
+ *
+ * Phase 7.3. Entries carry no audit id of their own before this, so a flush
+ * sent everything outstanding to whatever audit happened to be open. Only a
+ * guard at the resume path stopped that, which is a promise made by a caller
+ * rather than by the record. An entry belonging elsewhere is refused exactly
+ * like any other permanent refusal: retained, surfaced, never written here and
+ * never silently dropped.
+ */
+export const FOREIGN_ENTRY_CODE = 'WRONG_AUDIT';
+
+export const entryBelongsTo = (entry, auditId) =>
+  Boolean(entry) && (!entry.auditId || entry.auditId === auditId);
+
+/**
+ * Refuse every entry that belongs to another audit, and release any that are
+ * home again. Returns how many were refused.
+ *
+ * WRONG_AUDIT means refused *here*, not refused for good. An auditor who opens
+ * another audit and comes back must find their grades sendable again: the
+ * alternative is a queue that can only be cleared by re-grading every item by
+ * hand, which is the kind of dead end this whole queue exists to prevent. Every
+ * other refusal is left exactly as it was, because those are the server's
+ * answers and nothing about opening a different audit changes them.
+ */
+export function markForeignEntries(queue, auditId) {
+  let marked = 0;
+  for (const entry of pendingEntries(queue)) {
+    const foreignBlock = Boolean(entry.blocked && entry.error && entry.error.code === FOREIGN_ENTRY_CODE);
+    if (entryBelongsTo(entry, auditId)) {
+      if (foreignBlock) {
+        queue.set(writeKey(entry.itemId, entry.shiftId), { ...entry, blocked: false, error: null });
+      }
+      continue;
+    }
+    // A refusal the server actually gave is not replaced by this one. That
+    // answer stands whatever audit is open, and overwriting it would let a
+    // round trip through another audit quietly clear a 42501.
+    if (entry.blocked && !foreignBlock) continue;
+    markFailure(queue, entry.itemId, entry.shiftId, {
+      code: FOREIGN_ENTRY_CODE,
+      permanent: true,
+      message: 'This change was made in a different audit.',
+    });
+    marked += 1;
+  }
+  return marked;
+}
+
+/** An item id this build's checklist does not contain. Refused, never dropped. */
+export const UNKNOWN_ITEM_CODE = 'UNKNOWN_ITEM';
+
+export const unknownItemError = (itemId) => ({
+  code: UNKNOWN_ITEM_CODE,
+  permanent: true,
+  message: `${itemId} is not in this version of the checklist.`,
+});
 
 export const pendingCount = (queue) => queue.size;
 
@@ -196,7 +260,12 @@ export function syncLabel(state, pending = 0, blocked = 0) {
   switch (state) {
     case SYNC.SYNCED:      return { text: 'SYNCED', tone: 'ok' };
     case SYNC.PENDING:     return { text: pending > 0 ? `SAVING ${pending}` : 'SAVING', tone: 'busy' };
-    case SYNC.ERROR:       return { text: pending > 0 ? `UNSAVED ${pending}` : 'SYNC ERROR', tone: 'bad' };
+    // Phase 7.3. A transient failure with work still outstanding is not a dead
+    // end: the queue retries it on the next grade, the next reconnection and
+    // every tick. RETRYING says that truthfully, where UNSAVED read as though
+    // the app had given up. With nothing outstanding there is nothing being
+    // retried, so that case keeps its own plain wording.
+    case SYNC.ERROR:       return { text: pending > 0 ? `RETRYING ${pending}` : 'SYNC ERROR', tone: 'bad' };
     case SYNC.SIGNED_OUT:  return { text: pending > 0 ? `SIGNED OUT ${pending}` : 'SIGNED OUT', tone: 'bad' };
     // Named REFUSED rather than blocked or failed: it is the server's answer,
     // not a state the app has got itself into, and it will not clear on its
@@ -224,7 +293,15 @@ export function blockedMessage(reasons = []) {
   if (first.code === '23503') {
     return `${scope} were refused because this audit no longer exists in Specula. Your grades are still on this device. Do not close the app.`;
   }
-  return `${scope} were refused by Specula and will not be retried: ${first.message}`;
+  if (first.code === UNKNOWN_ITEM_CODE) {
+    return `${scope} were refused because they are for checklist items this version of the console does not have. Update the console, then re-enter them.`;
+  }
+  if (first.code === FOREIGN_ENTRY_CODE) {
+    return `${scope} were made in a different audit and were not saved to this one. Open that audit again to send them.`;
+  }
+  // Phase 7.3. No raw database text. The code is still kept on the entry for
+  // diagnostics; what an auditor is shown is a sentence they can act on.
+  return `${scope} were refused by Specula and will not be retried. Contact Specula with this audit's reference.`;
 }
 
 /**
@@ -331,6 +408,9 @@ export function serializeQueue(queue, auditId) {
       itemId: e.itemId,
       shiftId: e.shiftId,
       patch: e.patch,
+      // Carried per entry as well as on the envelope, so an entry can never be
+      // separated from the audit it was made in.
+      auditId: e.auditId || auditId || null,
       attempts: e.attempts || 0,
       error: e.error || null,
       blocked: !!e.blocked,
@@ -375,6 +455,10 @@ export function deserializeQueue(raw) {
         itemId,
         shiftId,
         patch,
+        // An entry written before entries carried one falls back to the
+        // envelope's audit id, which is the audit it was saved with.
+        auditId: (typeof entry.auditId === 'string' && entry.auditId)
+          || (typeof raw.auditId === 'string' && raw.auditId) || null,
         attempts: Number.isFinite(entry.attempts) ? entry.attempts : 0,
         error: entry.error && typeof entry.error === 'object' ? entry.error : null,
         blocked: !!entry.blocked,

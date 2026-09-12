@@ -39,7 +39,9 @@ test('the console reads the token from the audit row and never writes one', () =
   assert.match(APP, /useEffect\(\(\) => \{ setPublication\(null\); setPublicToken\(null\); \}, \[ids\.auditId\]\);/,
     'a different audit never shows the previous audit\'s link');
   assert.equal(/public_token\s*[:=]/.test(APP), false, 'no insert or update ever sets public_token');
-  assert.equal((APP.match(/setPublicToken\(/g) || []).length, 2, 'reset per audit and read from the row: nowhere else');
+  // Phase 7.3 adds the third: the audit-scoped reset clears it along with
+  // everything else that belongs to the audit being left behind.
+  assert.equal((APP.match(/setPublicToken\(/g) || []).length, 3, 'reset per audit, cleared on switch, and read from the row: nowhere else');
 });
 
 test('the finish screen shows the generated link, not a hand-built ref URL', () => {
