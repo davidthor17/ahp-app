@@ -337,7 +337,8 @@ test('the frozen published figure and the live figure are kept apart', () => {
 
 test('the console reads the publication in both load paths and drops the stale copy', () => {
   const app = readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src/App.jsx'), 'utf8');
-  assert.equal((app.match(/snapshot_locked_at, status, published_result'\)/g) || []).length, 2,
+  // Phase 7.2 adds public_token to the remote pull, for the shared link.
+  assert.equal((app.match(/snapshot_locked_at, status, published_result(, public_token)?'\)/g) || []).length, 2,
     'resume and the remote pull both read status and published_result');
   assert.equal((app.match(/setPublication\(serverPublication\(auditRow\)\)/g) || []).length, 2);
   assert.match(app, /publishState: shownPublishState/, 'the gate reads the effective state');

@@ -30,6 +30,11 @@
 // is a slower brute force, not an impossible one. Closing that gap for real
 // is what public_token (122 bits, a real UUID) is for, once speculaone-web
 // is updated to require it — a change to that repository, not this one.
+//
+// Phase 7.2: speculaone-web now reads every report through one function,
+// public.get_public_report, by exact token or exact ref, and anon can no longer
+// list audits. New links are shared by token (publicReportLink below). ?ref=
+// links keep working, so no issued link is ever invalidated.
 
 const HEX = '0123456789ABCDEF';
 
@@ -62,4 +67,19 @@ export function randomSuffix() {
 /** AHP-{year}-{8 hex chars}, e.g. "AHP-2026-9F3C7A2B". */
 export function genAuditRef(now = new Date()) {
   return `AHP-${now.getFullYear()}-${randomSuffix()}`;
+}
+
+export const REPORT_PAGE = 'speculaone.com/report.html';
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The public link for an audit's report. By token whenever the console knows
+ * it, which is every signed-in session once the audit row has been read. By ref
+ * only until then: a ref link still opens the same report, it is just the
+ * guessable one. Null when there is nothing to link to.
+ */
+export function publicReportLink({ publicToken, ref } = {}) {
+  if (typeof publicToken === 'string' && UUID.test(publicToken)) return `${REPORT_PAGE}?token=${publicToken}`;
+  if (typeof ref === 'string' && ref) return `${REPORT_PAGE}?ref=${encodeURIComponent(ref)}`;
+  return null;
 }

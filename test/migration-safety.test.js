@@ -528,3 +528,115 @@ test('the migration writes no row — no insert, update, delete or truncate anyw
     assert.equal(raw.includes(verb), false, `${P67} must not contain "${verb}", even in a comment`);
   }
 });
+
+// ── Phase 7.2: one function in front of the public report ───────────────────
+//
+// Same discipline as Phase 6.7: the text of the SQL is proved here, and the
+// anon REST requests in each file's VERIFICATION section prove the behaviour
+// once applied. 7.2a adds the function and grants nothing on any table; 7.2b
+// removes anon's direct SELECT on exactly three tables and touches nothing else.
+
+const P72A = '2026-09-11-phase72a-public-report-function.sql';
+const P72B = '2026-09-11-phase72b-revoke-direct-report-access.sql';
+const p72a = () => statements(read(P72A)).toLowerCase();
+const p72b = () => statements(read(P72B)).toLowerCase();
+const fnBody = () => p72a().match(/as \$\$([\s\S]*?)\$\$;/)[1];
+
+test('both Phase 7.2 migrations exist', () => {
+  assert.ok(files.includes(P72A), `${P72A} is missing`);
+  assert.ok(files.includes(P72B), `${P72B} is missing`);
+});
+
+test('the report function is security definer with an empty search_path, read-only, and plain SQL', () => {
+  const sql = p72a();
+  assert.match(sql, /create or replace function public\.get_public_report\(p_token uuid default null, p_ref text default null\)/);
+  assert.match(sql, /returns jsonb\s+language sql\s+stable\s+security definer\s+set search_path = ''/);
+  assert.equal(/plpgsql|format\(|execute\s+'|quote_ident|quote_literal/.test(sql), false, 'no dynamic SQL of any kind');
+  assert.equal(/volatile/.test(sql), false);
+});
+
+test('every relation in the function is schema-qualified, since the search_path is empty', () => {
+  const body = fnBody();
+  const relations = [...body.matchAll(/\bfrom\s+([a-z_.]+)/g)].map((m) => m[1]).filter((r) => r !== 'target');
+  assert.deepEqual([...new Set(relations)].sort(), ['public.audit_items', 'public.audits', 'public.properties']);
+});
+
+test('the lookup is one published audit by exact token, or by exact ref only when there is no token', () => {
+  const body = fnBody();
+  assert.match(body, /where a\.status = 'published'/);
+  assert.match(body, /\(p_token is not null and a\.public_token = p_token\)/);
+  assert.match(body, /\(p_token is null and nullif\(p_ref, ''\) is not null and a\.ref = p_ref\)/);
+  assert.match(body, /limit 1/);
+  assert.equal(/\blike\b|\bilike\b|similar to|~\*?\s|lower\(|upper\(|trim\(/.test(body), false, 'no pattern or loosened match');
+});
+
+test('the function builds its shape explicitly, and never returns an internal id or the token', () => {
+  const body = fnBody();
+  assert.equal(/select \*|\.\*/.test(body), false, 'no select *');
+  const keys = [...body.matchAll(/'([a-z_]+)',\s/g)].map((m) => m[1]);
+  assert.deepEqual([...new Set(keys)].sort(), [
+    'auditor_summary', 'category', 'city', 'country', 'critical_failures', 'date',
+    'item_id', 'items', 'name', 'properties', 'published_result', 'ref', 'section_id', 'status', 'tier',
+  ]);
+  for (const hidden of ['id', 'audit_id', 'property_id', 'public_token', 'auditor_id', 'note', 'na_note', 'na_reason']) {
+    assert.equal(keys.includes(hidden), false, `${hidden} must not be in the envelope`);
+  }
+});
+
+test('items, the property row and the raw summary are returned only for a report with no payload', () => {
+  const body = fnBody();
+  for (const key of ['auditor_summary', 'critical_failures', 'properties', 'items']) {
+    assert.match(body, new RegExp(`'${key}',\\s+case when t\\.published_result is null then`), `${key} is legacy-only`);
+  }
+});
+
+test('the function is executable by anon and authenticated only, and 7.2a grants nothing on any table', () => {
+  const sql = p72a();
+  assert.match(sql, /revoke all on function public\.get_public_report\(uuid, text\) from public;/);
+  assert.match(sql, /grant execute on function public\.get_public_report\(uuid, text\) to anon, authenticated;/);
+  assert.equal((sql.match(/\bgrant\b/g) || []).length, 1, 'one grant, the execute');
+  assert.equal(/\bon public\.[a-z_]+ (to|from)\b/.test(sql), false, 'no table privilege changes');
+  assert.equal(/create policy|alter policy|drop policy|row level security/.test(sql), false);
+});
+
+test('7.2b revokes SELECT from anon on exactly audits, audit_items and properties', () => {
+  const sql = p72b();
+  const revokes = sql.match(/revoke[^;]*;/g) || [];
+  assert.deepEqual(revokes.map((r) => r.replace(/\s+/g, ' ')), [
+    'revoke select on public.audits from anon;',
+    'revoke select on public.audit_items from anon;',
+    'revoke select on public.properties from anon;',
+  ]);
+  assert.equal(/\bgrant\b/.test(sql), false, 'it grants nothing');
+  assert.equal(/create policy|alter policy|drop policy|row level security|function/.test(sql), false);
+  for (const other of ['activity_log', 'auditors', 'communications', 'contacts', 'documents', 'expenses',
+    'hotel_groups', 'invoices', 'leads', 'opportunities', 'tasks', 'audit_item_photos', 'authenticated']) {
+    assert.equal(new RegExp(`\\b${other}\\b`).test(sql), false, `${other} is outside Phase 7.2`);
+  }
+});
+
+test('7.2b states the order it depends on and why direct access goes', () => {
+  const raw = read(P72B);
+  assert.match(raw, /PRECONDITION: apply ONLY after/);
+  assert.match(raw, /every public report goes offline/);
+  assert.match(raw, /A row policy cannot require a request to name one specific row/);
+  assert.match(raw, /leads \(its public INSERT policy\s*\n?--\s*stays exactly as it is\)/);
+});
+
+test('7.2b documents a rollback that restores exactly the Phase 6.7 column grants', () => {
+  const cols = (text, table) => text.match(new RegExp(`grant select \\(([^)]*)\\) on public\\.${table} to anon;`))[1]
+    .split(',').map((c) => c.trim()).sort();
+  const rollback = read(P72B).toLowerCase().replace(/\n--\s*/g, ' ');
+  for (const table of ['audits', 'audit_items', 'properties']) {
+    assert.deepEqual(cols(rollback, table), cols(p67sql(), table), `${table} rollback matches 6.7`);
+  }
+});
+
+test('neither Phase 7.2 migration writes, drops or regenerates anything', () => {
+  for (const file of [P72A, P72B]) {
+    const raw = read(file).toLowerCase();
+    for (const verb of ['insert into', 'update public.', 'delete from', 'truncate ', 'drop table', 'alter table', 'gen_random_uuid']) {
+      assert.equal(raw.includes(verb), false, `${file} must not contain "${verb}"`);
+    }
+  }
+});

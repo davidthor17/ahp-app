@@ -13,7 +13,7 @@ import { certify as frameworkCertify } from "./framework/certification.js";
 import { analyzeAuditIntelligence } from "./framework/auditIntelligence.js";
 import { buildExecutiveReport } from "./framework/executiveReport.js";
 import { buildClientReport } from "./framework/clientReport.js";
-import { genAuditRef } from "./framework/reportIdentifier.js";
+import { genAuditRef, publicReportLink } from "./framework/reportIdentifier.js";
 import { NA_REASON } from "./framework/weights.js";
 import {
   buildSnapshot, resolveScoringProfile, classifyLoadedAudit, canFreeze,
@@ -301,6 +301,7 @@ export default function AHPAudit() {
   const [summaryDraft, setSummaryDraft]   = useState('');
   const [auditTier, setAuditTier]         = useState('full'); // desk | spot | full
   const [publishState, setPublishState]   = useState(PUBLISH_STATE.IDLE);
+  const [publicToken, setPublicToken]     = useState(null);
   // Phase 7.1. What the server records about this audit's publication, read
   // with the row. publishState above is only this session's memory of an
   // attempt and resets on reload; this does not.
@@ -668,7 +669,7 @@ export default function AHPAudit() {
   // A publication belongs to one audit. Starting or opening another clears it
   // until that audit's own row says otherwise, so a published audit's state
   // can never carry over onto a new draft.
-  useEffect(() => { setPublication(null); }, [ids.auditId]);
+  useEffect(() => { setPublication(null); setPublicToken(null); }, [ids.auditId]);
 
   // once signed in, if there's an auditId already known, pull the latest remote copy
   // (covers: same auditor picks this up on a second device)
@@ -689,7 +690,7 @@ export default function AHPAudit() {
         // transport failure.
         const { data: auditRow, error: aErr } = await supabase
           .from('audits')
-          .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at, status, published_result')
+          .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at, status, published_result, public_token')
           .eq('id', ids.auditId).maybeSingle();
         if (aErr) throw aErr;
 
@@ -734,6 +735,9 @@ export default function AHPAudit() {
         // session believing it was a draft and offered PUBLISH again. The row
         // is the record, so the screen follows it.
         setPublication(serverPublication(auditRow));
+        // Phase 7.2. The report is shared by its token, read from the row.
+        // Never generated or changed here: the database sets it once.
+        setPublicToken(auditRow ? auditRow.public_token || null : null);
         // An audit that is not in the database is not synced, whatever else
         // succeeded. Saying otherwise would tell an auditor their work is
         // stored when there is nothing on the other end to store it in.
@@ -2943,7 +2947,7 @@ export default function AHPAudit() {
               </div>
               {ids.auditRef && (
                 <div style={{ padding: '12px 14px', borderRadius: '8px', background: C.surface2, border: `1px solid ${C.border}`, fontFamily: "'IBM Plex Mono', monospace", fontSize: '12px', color: C.dim, wordBreak: 'break-all' }}>
-                  speculaone.com/report.html?ref={ids.auditRef}
+                  {publicReportLink({ publicToken, ref: ids.auditRef })}
                 </div>
               )}
             </div>

@@ -1,0 +1,94 @@
+-- Phase 7.2b: remove anon's direct read access to the three report tables.
+--
+-- Applies to: public.audits, public.audit_items, public.properties
+-- Affected:   anon's SELECT privilege on those three tables only. No row, no
+--             column, no RLS policy, and no other role or table is touched.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PRECONDITION: apply ONLY after
+--
+--   1. 2026-09-11-phase72a-public-report-function.sql is applied, and
+--   2. the speculaone-web reader that calls public.get_public_report is
+--      deployed and verified against AHP-2026-8B10 and AHP-2026-D699.
+--
+-- Applied earlier, every public report goes offline: the reader then deployed
+-- still reads the tables directly.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+-- WHY
+--
+-- A row policy cannot require a request to name one specific row, so while anon
+-- may SELECT these tables directly it may also list them: every published
+-- audit's id, ref and public_token, every payload, and the raw item statuses of
+-- payload-backed audits that never needed them. Phase 7.2a moved the public
+-- report onto public.get_public_report, which returns one report for one exact
+-- token or ref and nothing else. With the reader on that function, these
+-- direct grants serve no purpose and are the whole of the enumeration surface.
+--
+-- Revoking the table privilege also revokes every column privilege anon held
+-- on it (Phase 6.7's narrowed column grants included), per PostgreSQL's REVOKE
+-- semantics. The row policies behind the listing are left in place,
+-- deliberately: with no privilege underneath them they grant anon nothing, and
+-- this phase does not edit RLS. As recorded from pg_policies on 2026-09-11,
+-- all three are TO public and none is in this repository:
+--
+--   audits       "public reads published audits"
+--                  using (status = 'published')
+--   audit_items  "public reads items of published audits"
+--                  using (exists (audit a where a.id = audit_id
+--                                 and a.status = 'published'))
+--   properties   "public reads properties with published audits"
+--                  using (exists (audit a where a.property_id = id
+--                                 and a.status = 'published'))
+--
+-- TO public includes authenticated, which keeps its table privileges, so any
+-- signed-in account can still list published audits through these policies.
+-- That is outside this phase and is recorded, not changed, here.
+--
+-- NOT touched, deliberately: activity_log, auditors, communications, contacts,
+-- documents, expenses, hotel_groups, invoices, leads (its public INSERT policy
+-- stays exactly as it is), opportunities, tasks, audit_item_photos. The
+-- 2026-09-11 read-only audit found none of them readable by anon; their
+-- grants are outside this phase.
+--
+-- ─────────────────────────────────────────────────────────────────────────────
+
+begin;
+
+revoke select on public.audits      from anon;
+revoke select on public.audit_items from anon;
+revoke select on public.properties  from anon;
+
+commit;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- VERIFICATION
+--
+-- Direct reads must now be refused (42501), not merely filtered:
+--
+--   GET /rest/v1/audits?select=id,ref,public_token
+--   GET /rest/v1/audit_items?select=item_id&limit=1
+--   GET /rest/v1/properties?select=id,name&limit=1
+--
+-- The function must still return both reports:
+--
+--   POST /rest/v1/rpc/get_public_report  {"p_ref":"AHP-2026-8B10"}
+--   POST /rest/v1/rpc/get_public_report  {"p_ref":"AHP-2026-D699"}
+--
+-- And in the database, anon holds no SELECT on the three tables:
+--
+--   select table_name, privilege_type from information_schema.role_table_grants
+--    where grantee = 'anon' and table_schema = 'public'
+--      and table_name in ('audits', 'audit_items', 'properties');   -- 0 rows
+--   select table_name, column_name from information_schema.column_privileges
+--    where grantee = 'anon' and table_schema = 'public'
+--      and table_name in ('audits', 'audit_items', 'properties');   -- 0 rows
+--
+-- ROLLBACK (restores exactly the Phase 6.7 state):
+--
+--   begin;
+--   grant select (id, ref, date, status, tier, auditor_summary, critical_failures,
+--                 published_result, property_id, public_token) on public.audits to anon;
+--   grant select (audit_id, item_id, section_id, status) on public.audit_items to anon;
+--   grant select (id, name, city, country, category) on public.properties to anon;
+--   commit;
