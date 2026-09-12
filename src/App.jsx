@@ -578,7 +578,12 @@ export default function AHPAudit() {
     try {
       const { data: auditRow, error: aErr } = await supabase
         .from('audits')
-        .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at, status, published_result')
+        // checklist_items is the pin: the exact set of items this audit froze.
+        // Phase 7.3B. It was missing from this list, so snapshotFromRow read
+        // undefined and normalisePin returned null: a resumed audit silently
+        // dropped its pin and went back to the live catalogue, which is the one
+        // thing the pin exists to prevent.
+        .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, checklist_items, snapshot_locked_at, status, published_result')
         .eq('id', row.id).maybeSingle();
       if (aErr) throw aErr;
 
@@ -746,7 +751,10 @@ export default function AHPAudit() {
         // transport failure.
         const { data: auditRow, error: aErr } = await supabase
           .from('audits')
-          .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, snapshot_locked_at, status, published_result, public_token')
+          // checklist_items travels with the rest of the basis, for the reason
+          // given on the resume select above: without it the pull hands back a
+          // basis with no pin and the audit reverts to the live catalogue.
+          .select('tier, property_category, facility_profile, scope_sections, framework_version, checklist_version, checklist_items, snapshot_locked_at, status, published_result, public_token')
           .eq('id', ids.auditId).maybeSingle();
         if (aErr) throw aErr;
 
